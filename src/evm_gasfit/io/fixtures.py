@@ -6,6 +6,7 @@ import re
 
 import pandas as pd
 
+from evm_gasfit.errors import ConfigError
 from evm_gasfit.io import FixtureMatchResult, report_unmatched_fixtures
 
 # Accepts both the legacy ``file.py__test[...]`` form and the pytest node-ID
@@ -52,6 +53,52 @@ def parse_fixture_name(fixture_name: str) -> dict[str, str | list[str]]:
     }
 
 
+def _same_param_value(left: object, right: object) -> bool:
+    """Return whether CSV and fixture-name representations describe one value."""
+    if pd.isna(left) or pd.isna(right):
+        return True
+    if left == right:
+        return True
+    try:
+        return float(left) == float(right)
+    except (TypeError, ValueError):
+        return str(left) == str(right)
+
+
+def _coalesce_runtime_params(
+    runtimes_df: pd.DataFrame, parsed_df: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Coalesce equal explicit and fixture-name ``param_`` columns."""
+    parsed_params = {
+        column for column in parsed_df.columns if column.startswith("param_")
+    }
+    explicit_params = {
+        column for column in runtimes_df.columns if column.startswith("param_")
+    }
+    shared = sorted(parsed_params & explicit_params)
+    parsed_by_fixture = parsed_df.set_index("fixture_name")
+    for column in shared:
+        parsed_values = runtimes_df["fixture_name"].map(parsed_by_fixture[column])
+        conflicts = [
+            fixture
+            for fixture, left, right in zip(
+                runtimes_df["fixture_name"],
+                runtimes_df[column],
+                parsed_values,
+            )
+            if not _same_param_value(left, right)
+        ]
+        if conflicts:
+            raise ConfigError(
+                f"runtimes CSV column {column!r} conflicts with fixture-name "
+                f"parameter for fixture {conflicts[0]!r}"
+            )
+        runtimes_df[column] = runtimes_df[column].where(
+            runtimes_df[column].notna(), parsed_values
+        )
+    return runtimes_df, parsed_df.drop(columns=shared)
+
+
 def build_fixtures_df(
     runtimes_df: pd.DataFrame,
     opcounts: dict[str, dict[str, float]],
@@ -64,17 +111,15 @@ def build_fixtures_df(
         opcounts: Mapping from :func:`load_opcounts`.
 
     Returns:
-        A pair ``(fixtures_df, match_result)``. ``fixtures_df`` has one row per
-        ``(client_name, fixture_name)`` carrying: the original runtime columns,
-        ``test_file`` and ``test_name`` from the parser, one ``param_<key>``
-        column per parsed key/value param (string-valued — model specs coerce
-        types per-spec via ``fixture_params:``; the ``param_`` prefix prevents
-        collisions with opcode mnemonics like ``SSTORE``), ``opcount``, and one
-        column per opcode mnemonic appearing in any fixture (missing values
-        filled with 0). Fixtures appearing in only one input are dropped with a
-        single count-only warning per direction on the ``evm_gasfit`` logger;
-        their names are returned on ``match_result`` for downstream export to
-        ``meta.json``.
+        A frame carrying original runtime columns, parsed ``test_file`` and
+        ``test_name``, raw ``param_<key>`` fields, ``opcount``, and per-opcode
+        counts. Explicit ``param_<key>`` runtime columns carry canonical
+        workload parameters omitted from the fixture ID; equal explicit and
+        parsed facts coalesce, while conflicts are rejected. The ``param_``
+        prefix prevents collisions with opcode mnemonics like ``SSTORE``.
+        Fixtures appearing in only one input are dropped with a count-only
+        warning per direction on the ``evm_gasfit`` logger; their names are
+        returned on ``match_result`` for downstream export to ``meta.json``.
     """
     runtimes_fixtures = set(runtimes_df["fixture_name"].unique())
     opcounts_fixtures = set(opcounts.keys())
@@ -97,10 +142,16 @@ def build_fixtures_df(
             "test_file": parsed["test_file"],
             "test_name": parsed["test_name"],
         }
-        row.update({f"param_{k}": v for k, v in parsed["params"].items()})  # type: ignore[arg-type]
+        row.update(
+            {f"param_{k}": v for k, v in parsed["params"].items()}  # type: ignore[arg-type]
+        )
         parsed_rows.append(row)
-    parsed_df = pd.DataFrame(parsed_rows)
-
+    # Supplying columns for populated data would discard parsed parameters.
+    parsed_df = pd.DataFrame(
+        parsed_rows,
+        columns=None if parsed_rows else ["fixture_name", "test_file", "test_name"],
+    )
+    df, parsed_df = _coalesce_runtime_params(df, parsed_df)
     df = df.merge(parsed_df, on="fixture_name", how="left")
 
     # Build a wide opcode-count table indexed by fixture_name and left-join it.
@@ -126,4 +177,11 @@ def build_fixtures_df(
     opcounts_df[opcode_cols] = opcounts_df[opcode_cols].fillna(0.0)
 
     df = df.merge(opcounts_df, on="fixture_name", how="left")
+    # Record which columns are per-opcode counts so downstream transforms
+    # (notably baseline pairing) can diff exactly ``test_runtime_ms`` plus
+    # these — never arbitrary numeric metadata that rode along in the
+    # runtimes CSV (repetition counters, gas quantities, session sequence
+    # numbers). Read once before any row-wise operation; ``attrs`` is not
+    # guaranteed to survive every pandas op.
+    df.attrs["opcode_columns"] = list(opcode_cols)
     return df, match_result

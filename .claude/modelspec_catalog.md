@@ -75,21 +75,21 @@ a partner whose own fit is biased. Both are auditable: `glue_results.csv`
 carries the partner's fit; `glue_opcodes_by_test.csv` carries the
 detector's `corr`/`ratio` per partner.
 
-## New gas-param names introduced (lenient warning per §2.5)
+## New gas-param names introduced
 
-The osaka fallback does not include these — listing them as `target_coef`
-RHS values will emit a warning at config-load time and surface in
-`new_gas_proposal.md` warnings, which is fine: they represent params the
-runtimes data is offering to *propose*.
+The Prague fallback provides only genuine Prague `GasCosts` fields (plus the
+zero-valued BLAKE2F base decomposition used by the catalog). These catalog
+names are proposed parameters rather than fork defaults, so users declare
+them in `new_params` with an explicit current value or `null`:
 
-- `OPCODE_CALLDATACOPY_PER_WORD` — from `test_calldatacopy_from_origin` (fallback ships a shared `OPCODE_COPY_PER_WORD`; this preset proposes a CALLDATACOPY-specific value)
-- `OPCODE_CODECOPY_PER_WORD` — from `test_codecopy_benchmark` (same reasoning)
-- `OPCODE_MCOPY_PER_WORD` — from `test_mcopy` (same reasoning)
-- `COLD_ACCOUNT_NOCODE_ACCESS` — from `cold_account_nocode_access` (fallback ships a single `COLD_ACCOUNT_ACCESS = 2600`; the upstream EIP-8038 proposal splits cold account access by whether the target carries code)
-- `COLD_ACCOUNT_CODE_ACCESS` — from `cold_account_code_access` (same reasoning as `COLD_ACCOUNT_NOCODE_ACCESS`)
-- `COLD_ACCOUNT_NOCODE_WRITE` / `COLD_ACCOUNT_CODE_WRITE` — combined cold access+write cost fitted directly from the `value_sent_1` (value-transferring) fixtures of `cold_account_*_write`. These are scaffolding params: the per-write delta `ACCOUNT_WRITE` is recovered from them in `derived`
-- `ACCOUNT_WRITE` — **derived**, not fitted: `max(0, COLD_ACCOUNT_CODE_WRITE − COLD_ACCOUNT_CODE_ACCESS, COLD_ACCOUNT_NOCODE_WRITE − COLD_ACCOUNT_NOCODE_ACCESS)`. The combined write is bounded by a single worst-case client per context (rather than summing two independent per-param maxima), and the worst of the two contexts wins
-- `STORAGE_WRITE` — **derived**, not fitted: `max(0, COLD_STORAGE_WRITE − COLD_STORAGE_ACCESS)`, where `COLD_STORAGE_WRITE` (a raw osaka field, =5000) is now fitted directly from the `write_new_value_True` fixtures as the combined access+write cost
+- `OPCODE_CALLDATACOPY_PER_WORD`, `OPCODE_CODECOPY_PER_WORD`, and
+  `OPCODE_MCOPY_PER_WORD` distinguish the catalog's operation-specific fits
+  from Prague's shared `OPCODE_COPY_PER_WORD`.
+- `COLD_ACCOUNT_NOCODE_ACCESS`, `COLD_ACCOUNT_CODE_ACCESS`,
+  `COLD_ACCOUNT_NOCODE_WRITE`, `COLD_ACCOUNT_CODE_WRITE`, and derived
+  `ACCOUNT_WRITE` remain proposal names.
+- `STORAGE_WRITE` remains derived from the Prague raw
+  `COLD_STORAGE_WRITE` and `COLD_STORAGE_ACCESS` baseline.
 
 The underlying `model_by` columns (`calldata_size`, `return_size`,
 `code_size`, `copy_size`, `msg_size`) carry **byte** units in the runtime
@@ -339,12 +339,13 @@ Notes:
   fixtures run the surrounding harness *without* the target account
   operation, pairing each `False` fixture against the mean runtime of its
   `True` counterparts (the suite repeats every fixture across several trials,
-  so this is a many-to-one match, not 1:1). `overhead_baseline_param:
-  overhead_baseline` fits `target_coef` on the runtime delta (`False −
-  mean(True)`) instead of raw `False` runtime, and the per-opcode glue
-  detector (`glue/detect.py`) runs on that same delta — every opcode-count
-  column, not just runtime — rather than being skipped for baseline-paired
-  specs. This is what lets a single preset cover both opcode families:
+  so this is a many-to-one match, not 1:1). The catalog leaves
+  `overhead_baseline_match_params` unset because these fixture pairs retain
+  identical shapes; that default matches every other populated parameter.
+  `overhead_baseline_param: overhead_baseline` fits `target_coef` on the
+  runtime and count delta (`False − mean(True)`), so the per-opcode glue
+  detector runs on the variable work only. This is what lets a single preset
+  cover both opcode families:
   - `BALANCE`/`EXTCODEHASH`/`EXTCODESIZE`: keccak (`SHA3`) has an identical
     count in both variants, so it deltas to a constant and fails the
     detector's correlation threshold on its own — cancelled for free, never
@@ -416,38 +417,28 @@ iteration" below.
 
 ### Precompiles — 19 presets
 
-Every precompile preset uses the §2.1 escape hatch: `target_operation` carries
-the precompile's display name (which lands on `target_opcode` in
-`results.csv` / `new_gas.csv`, keeping each precompile's output rows readable;
-the aggregator itself routes rows back to their preset by `source_label`, §4.6),
-and `target_operation_count_source: STATICCALL` tells the §2.3 invariant —
-and the §4.4 glue candidate filter — that the `opcount` column is actually
-backed by the `STATICCALL` column. Each preset declares its own
-`filter_by` substring (e.g. `["bls12_g1add"]`) to pick out the precompile's
-slice of fixtures within the shared test file, since the display name does
-not appear as a fixture token.
+Every precompile preset uses a readable `target_operation` plus a semantic
+`target_operation_count_source` of the form
+`PRECOMPILE_0x<40 lowercase hexadecimal address>`. The counter records calls
+whose destination is that exact address. It is not `STATICCALL`: a wrapper can
+make extra static calls while only one invokes the precompile. Semantic keys
+are target evidence and are excluded from glue candidates.
 
-| Preset | `test_name` | Target | `model_by` | Writes |
-| --- | --- | --- | --- | --- |
-| `precompile_ecrecover` | `test_ecrecover` | `ECRECOVER` (count via `STATICCALL`, `filter_by: ["ecrecover"]`) | — | `PRECOMPILE_ECRECOVER` |
-| `precompile_sha256_fixed` | `test_sha256_fixed_size` | `SHA256` (count via `STATICCALL`, `filter_by: ["sha256"]`) | — | `target_coef: PRECOMPILE_SHA256_BASE`, `size_words: PRECOMPILE_SHA256_PER_WORD` (via `fixture_params.size_words = {source: size, transform: bytes_to_words}`) |
-| `precompile_sha256_uncachable` | `test_sha256_uncachable` | `SHA256` (count via `STATICCALL`, `filter_by: ["sha256"]`) | — | `target_coef: PRECOMPILE_SHA256_BASE`, `size_words: PRECOMPILE_SHA256_PER_WORD` (via `fixture_params.size_words = {source: size, transform: bytes_to_words}`) |
-| `precompile_ripemd160_fixed` | `test_ripemd160_fixed_size` | `RIPEMD160` (count via `STATICCALL`, `filter_by: ["ripemd160"]`) | — | `target_coef: PRECOMPILE_RIPEMD160_BASE`, `size_words: PRECOMPILE_RIPEMD160_PER_WORD` (via `fixture_params.size_words = {source: size, transform: bytes_to_words}`) |
-| `precompile_ripemd160_uncachable` | `test_ripemd160_uncachable` | `RIPEMD160` (count via `STATICCALL`, `filter_by: ["ripemd160"]`) | — | `target_coef: PRECOMPILE_RIPEMD160_BASE`, `size_words: PRECOMPILE_RIPEMD160_PER_WORD` (via `fixture_params.size_words = {source: size, transform: bytes_to_words}`) |
-| `precompile_identity_fixed` | `test_identity_fixed_size` | `IDENTITY` (count via `STATICCALL`, `filter_by: ["identity"]`) | — | `target_coef: PRECOMPILE_IDENTITY_BASE`, `size_words: PRECOMPILE_IDENTITY_PER_WORD` (via `fixture_params.size_words = {source: size, transform: bytes_to_words}`) |
-| `precompile_identity_uncachable` | `test_identity_uncachable` | `IDENTITY` (count via `STATICCALL`, `filter_by: ["identity"]`) | — | `target_coef: PRECOMPILE_IDENTITY_BASE`, `size_words: PRECOMPILE_IDENTITY_PER_WORD` (via `fixture_params.size_words = {source: size, transform: bytes_to_words}`) |
-| `precompile_blake2f` | `test_blake2f_benchmark` | `BLAKE2F` (count via `STATICCALL`, `filter_by: ["blake2f"]`) | — | `target_coef: PRECOMPILE_BLAKE2F_BASE`, `num_rounds: PRECOMPILE_BLAKE2F_PER_ROUND` |
-| `precompile_blake2f_uncachable` | `test_blake2f_uncachable` | `BLAKE2F` (count via `STATICCALL`, `filter_by: ["blake2f"]`) | — | `target_coef: PRECOMPILE_BLAKE2F_BASE`, `num_rounds: PRECOMPILE_BLAKE2F_PER_ROUND` |
-| `precompile_p256verify` | `test_p256verify` | `P256VERIFY` (count via `STATICCALL`, `filter_by: ["p256verify"]`) | — | `PRECOMPILE_P256VERIFY` |
-| `precompile_p256verify_uncachable` | `test_p256verify_uncachable` | `P256VERIFY` (count via `STATICCALL`, `filter_by: ["p256verify"]`) | — | `PRECOMPILE_P256VERIFY` |
-| `precompile_point_evaluation` | `test_point_evaluation` | `POINT_EVALUATION` (count via `STATICCALL`, `filter_by: ["point_evaluation"]`) | — | `PRECOMPILE_POINT_EVALUATION` |
-| `precompile_point_evaluation_uncachable` | `test_point_evaluation_uncachable` | `POINT_EVALUATION` (count via `STATICCALL`, `filter_by: ["point_evaluation"]`) | — | `PRECOMPILE_POINT_EVALUATION` |
-| `precompile_bn128_add` | `test_alt_bn128` | `ECADD` (count via `STATICCALL`, `filter_by: ["bn128_", "!bn128_mul"]`) | `[bn128]` | `PRECOMPILE_ECADD` |
-| `precompile_bn128_mul` | `test_alt_bn128` | `ECMUL` (count via `STATICCALL`, `filter_by: ["bn128_mul_"]`) | — | `PRECOMPILE_ECMUL` |
-| `precompile_bn128_add_uncachable` | `test_alt_bn128_uncachable` | `ECADD` (count via `STATICCALL`, `filter_by: ["ec_add"]`) | — | `PRECOMPILE_ECADD` |
-| `precompile_bn128_mul_uncachable` | `test_alt_bn128_uncachable` | `ECMUL` (count via `STATICCALL`, `filter_by: ["ec_mul_"]`) | — | `PRECOMPILE_ECMUL` |
-| `precompile_bn128_pairing` | `test_alt_bn128_benchmark` | `ECPAIRING` (count via `STATICCALL`, `filter_by: ["num_pairs"]`) | — | `target_coef: PRECOMPILE_ECPAIRING_BASE`, `num_pairs: PRECOMPILE_ECPAIRING_PER_POINT` |
-| `precompile_bn128_pairing_alt` | `test_ec_pairing` | `ECPAIRING` (count via `STATICCALL`) | — | `target_coef: PRECOMPILE_ECPAIRING_BASE`, `num_pairs: PRECOMPILE_ECPAIRING_PER_POINT` |
+| Address | Presets |
+| --- | --- |
+| `0x01` | ECRECOVER |
+| `0x02` | SHA256 fixed and uncachable |
+| `0x03` | RIPEMD160 fixed and uncachable |
+| `0x04` | IDENTITY fixed and uncachable |
+| `0x06`, `0x07`, `0x08` | BN128 add, multiply, and pairing variants |
+| `0x09` | BLAKE2F and uncachable |
+| `0x0a` | point evaluation and uncachable |
+| `0x0b`, `0x0c`, `0x0d`, `0x0e`, `0x0f`, `0x10` | BLS G1 add/MSM, G2 add/MSM, and field maps |
+| `0x0100` | P256VERIFY and uncachable |
+
+Each preset retains its existing `filter_by`, `model_by`, and output gas-param
+mapping. The source key is zero-padded to 20 bytes in the code, for example
+`PRECOMPILE_0x000000000000000000000000000000000000000b`.
 
 Notes:
 
@@ -499,24 +490,19 @@ the variant token (`bls12_g1add`, `bls12_g2add`, `bls12_g1msm`,
 `bls12_g2msm`, `bls12_fp_to_g1`, `bls12_fp_to_g2`) determines which BLS
 op was tested. The parser sees `bls12=g1add` etc.
 
-| Preset | `test_name` | Target | Writes |
-| --- | --- | --- | --- |
-| `precompile_bls_g1add` | `test_bls12_381` | `BLS12_G1ADD` (count via `STATICCALL`, `filter_by: ["bls12_g1add"]`) | `PRECOMPILE_BLS_G1ADD` |
-| `precompile_bls_g2add` | `test_bls12_381` | `BLS12_G2ADD` (count via `STATICCALL`, `filter_by: ["bls12_g2add"]`) | `PRECOMPILE_BLS_G2ADD` |
-| `precompile_bls_fp_to_g1` | `test_bls12_381` | `BLS12_MAP_FP_TO_G1` (count via `STATICCALL`, `filter_by: ["bls12_fp_to_g1"]`) | `PRECOMPILE_BLS_G1MAP` |
-| `precompile_bls_fp_to_g2` | `test_bls12_381` | `BLS12_MAP_FP_TO_G2` (count via `STATICCALL`, `filter_by: ["bls12_fp_to_g2"]`) | `PRECOMPILE_BLS_G2MAP` |
-| `precompile_bls_g1msm` | `test_bls12_g1_msm` | `BLS12_G1MSM` (count via `STATICCALL`, `filter_by: ["bls12_g1msm"]`) | `PRECOMPILE_BLS_G1MUL` (`model_by: [k]`) |
-| `precompile_bls_g2msm` | `test_bls12_g2_msm` | `BLS12_G2MSM` (count via `STATICCALL`, `filter_by: ["bls12_g2msm"]`) | `PRECOMPILE_BLS_G2MUL` (`model_by: [k]`) |
+| Preset | Address counter suffix | Writes |
+| --- | --- | --- |
+| `precompile_bls_g1add` | `...000b` | `PRECOMPILE_BLS_G1ADD` |
+| `precompile_bls_g2add` | `...000d` | `PRECOMPILE_BLS_G2ADD` |
+| `precompile_bls_fp_to_g1` | `...000f` | `PRECOMPILE_BLS_G1MAP` |
+| `precompile_bls_fp_to_g2` | `...0010` | `PRECOMPILE_BLS_G2MAP` |
+| `precompile_bls_g1msm` | `...000c` | `PRECOMPILE_BLS_G1MUL` (`model_by: [k]`) |
+| `precompile_bls_g2msm` | `...000e` | `PRECOMPILE_BLS_G2MUL` (`model_by: [k]`) |
 
-All BLS specs use the §2.1 precompile shape: a distinct `target_operation`
-display name per variant (used as `target_opcode` in the output rows) plus
-`target_operation_count_source: STATICCALL` so the §2.3 invariant and the
-§4.4 glue candidate filter both read from the `STATICCALL` opcount column.
-The non-target opcodes (GAS, CALLDATACOPY, etc.) get absorbed into the
-intercept or get adjusted away by glue. The presets sharing `test_bls12_381`
-are routed by `source_label` in the aggregator (§4.6), and their distinct
-`target_operation` display names keep the output rows readable, so they need
-no further plumbing.
+Each suffix expands to
+`PRECOMPILE_0x000000000000000000000000000000000000<suffix>`. The distinct
+semantic count source drives the invariant and is excluded from glue; it does
+not replace the readable display target in output rows.
 
 `test_bls12_381_uncachable` shares the same six variant tags as the four
 cachable presets plus the two MSM ones — adding eight more presets here

@@ -7,6 +7,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from evm_gasfit.config import Config
@@ -91,6 +92,109 @@ def _signed_pct(proposed: int, current: int) -> str:
     if pct == 0:
         return "0%"
     return f"{pct:+d}%"
+
+
+def _fmt_ms(value: object, digits: int = 4) -> str:
+    if value is None or (isinstance(value, float) and not np.isfinite(value)):
+        return "—"
+    try:
+        if pd.isna(value):
+            return "—"
+    except TypeError:
+        pass
+    return f"{float(value):.{digits}g}"
+
+
+def _comparison_table_md(proposal_output, config: Config) -> list[str]:
+    """Markdown rows for the mandatory compute-vs-current-gas table."""
+    from evm_gasfit.reports.comparison import build_comparison_df
+
+    df = build_comparison_df(proposal_output, config)
+    if df.empty:
+        return ["_No parameters measured._"]
+    lines = [
+        "| Gas param | Client | Measured runtime (ms) | CI | Current gas | "
+        "ms per gas | Relative costliness | Qualification |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for _, row in df.iterrows():
+        current = row["current_gas"]
+        current_cell = "—" if current is None or pd.isna(current) else str(int(current))
+        ci = (
+            "—"
+            if pd.isna(row["conf_int_low"]) or pd.isna(row["conf_int_high"])
+            else f"[{_fmt_ms(row['conf_int_low'])}, {_fmt_ms(row['conf_int_high'])}]"
+        )
+        rel = row["relative_costliness"]
+        rel_cell = "—" if rel is None or pd.isna(rel) else f"{float(rel):.2f}×"
+        lines.append(
+            f"| {row['gas_param']} | {row['client_name'] or '—'} | "
+            f"{_fmt_ms(row['runtime_ms'])} | {ci} | {current_cell} | "
+            f"{_fmt_ms(row['measured_ms_per_gas'])} | {rel_cell} | "
+            f"{row['qualification_status'] or '—'} |"
+        )
+    return lines
+
+
+def _qualification_table_md(qualification_df) -> list[str]:
+    """Markdown rows summarizing every planned model's qualification status."""
+    if qualification_df is None or qualification_df.empty:
+        return ["_No planned models recorded._"]
+    counts = qualification_df["status"].value_counts().to_dict()
+    summary = ", ".join(f"{count} {status}" for status, count in sorted(counts.items()))
+    lines = [
+        f"**{summary}** — one row per planned model; see `qualification.csv` for the full gate evidence.",
+        "",
+    ]
+    lines.append("| Test | Target | Client | Status | Adjusted estimate | Reasons |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    for _, row in qualification_df.iterrows():
+        reasons = str(row.get("reasons", "") or "")
+        reasons_cell = reasons if reasons else "—"
+        lines.append(
+            f"| {row['test_name']} | {row['target_opcode'] or '—'} | "
+            f"{row['client_name'] or '—'} | {row['status']} | "
+            f"{row.get('adjusted_estimate_status', '')} | {reasons_cell} |"
+        )
+    return lines
+
+
+def _scenarios_table_md(proposal_output, config: Config) -> list[str]:
+    """Markdown rows for the explicit pricing-scenario section."""
+    from evm_gasfit.reports.comparison import build_pricing_scenarios_df
+
+    df = build_pricing_scenarios_df(proposal_output, config)
+    lines: list[str] = []
+    for scenario in config.pricing_scenarios:
+        lines.append(f"### {scenario.name}")
+        lines.append("")
+        lines.append(
+            f"anchor {scenario.anchor_rate:.3g} gas/s · margin "
+            f"{scenario.margin_pct:.3g}% — price = ceil(anchor · (1 + margin) "
+            "· runtime_ms / 1000)"
+        )
+        lines.append("")
+        sub = df[df["scenario"] == scenario.name] if not df.empty else df
+        if sub.empty:
+            lines.append("_No measured runtimes to price._")
+            lines.append("")
+            continue
+        lines.append(
+            "| Gas param | Measured runtime (ms) | Scenario gas | Qualification |"
+        )
+        lines.append("| --- | --- | --- | --- |")
+        for _, row in sub.iterrows():
+            scenario_gas = (
+                "withheld"
+                if row["scenario_gas"] is None or pd.isna(row["scenario_gas"])
+                else str(int(row["scenario_gas"]))
+            )
+            lines.append(
+                f"| {row['gas_param']} | {_fmt_ms(row['runtime_ms'])} | "
+                f"{scenario_gas} | {row['qualification_status'] or '—'} |"
+            )
+        lines.append("")
+    return lines
 
 
 def _direction_counts(
@@ -208,7 +312,7 @@ def _weak_losing_candidates(
     """
     if candidates_df.empty or "is_winner" not in candidates_df.columns:
         return candidates_df.iloc[0:0]
-    losers = candidates_df[candidates_df["is_winner"] == False]
+    losers = candidates_df[candidates_df["is_winner"].eq(False)]
     weak_mask = (losers["pvalue"] >= pv_thresh) | (losers["rsquared"] < r2_thresh)
     weak = losers[weak_mask]
     dedupe_cols = [
@@ -673,7 +777,7 @@ def write_proposal_report(
     full_all_df = proposal_output.new_gas_all_df
     if "is_winner" in full_all_df.columns:
         winners_all_df = full_all_df[
-            (full_all_df["is_winner"] == True)
+            (full_all_df["is_winner"].eq(True))
             | (full_all_df["client_name"].astype(str).str.len() == 0)
         ]
     else:
@@ -684,32 +788,52 @@ def write_proposal_report(
     )
     missing_by_test, other_warnings = _partition_warnings(proposal_output.warnings)
     n_warn = sum(len(v) for v in missing_by_test.values()) + len(other_warnings)
-    poor_fit_rows = winners_all_df[winners_all_df.get("poor_fit", False) == True]
+    poor_fit_rows = (
+        winners_all_df[winners_all_df["poor_fit"].eq(True)]
+        if "poor_fit" in winners_all_df.columns
+        else winners_all_df.iloc[0:0]
+    )
 
     lines: list[str] = ["# New gas proposal", ""]
 
     # Run metadata.
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
-    anchor_label = _format_anchor_rate_mgas_s(config.anchor_rate)
+    if config.anchor_rate is None:
+        anchor_label = "none (comparison-only run)"
+    else:
+        anchor_label = _format_anchor_rate_mgas_s(config.anchor_rate)
     lines.append(
         f"_Generated {generated} · fork `{config.gas_costs.fork}` · "
         f"anchor_rate {anchor_label}_"
     )
     lines.append("")
 
+    has_anchor = config.anchor_rate is not None
     # Summary line.
-    lines.append(
-        f"**Summary:** {n_total} parameters proposed — "
-        f"{n_inc} increased, {n_dec} decreased, {n_new} new, "
-        f"{n_unresolved} unresolved · "
-        f"{n_warn} warning{'s' if n_warn != 1 else ''} · "
-        f"{len(poor_fit_rows)} poor-fit selection{'s' if len(poor_fit_rows) != 1 else ''}"
-    )
+    if has_anchor:
+        lines.append(
+            f"**Summary:** {n_total} parameters proposed — "
+            f"{n_inc} increased, {n_dec} decreased, {n_new} new, "
+            f"{n_unresolved} unresolved · "
+            f"{n_warn} warning{'s' if n_warn != 1 else ''} · "
+            f"{len(poor_fit_rows)} poor-fit selection{'s' if len(poor_fit_rows) != 1 else ''}"
+        )
+    else:
+        lines.append(
+            f"**Summary:** {n_total} parameters measured — comparison-only "
+            f"run (no pricing anchor; proposed-gas columns are empty) · "
+            f"{n_warn} warning{'s' if n_warn != 1 else ''} · "
+            f"{len(poor_fit_rows)} poor-fit selection{'s' if len(poor_fit_rows) != 1 else ''}"
+        )
     lines.append("")
 
-    # Diff table — fitted rows only.
+    # Diff table — fitted rows only. Without an anchor nothing is "fitted"
+    # in gas terms; the compute-vs-current section carries the run instead.
     fitted_df = new_gas_df[~new_gas_df["new_gas_rounded"].isna()]
-    unresolved_df = new_gas_df[new_gas_df["new_gas_rounded"].isna()]
+    if has_anchor:
+        unresolved_df = new_gas_df[new_gas_df["new_gas_rounded"].isna()]
+    else:
+        unresolved_df = new_gas_df.iloc[0:0]
 
     # Decide which optional sections will render so the TOC links match.
     plots_enabled = config.output.plots
@@ -732,38 +856,71 @@ def write_proposal_report(
     qualifying = [p for p in fitted_params if combo_counts.get(p, 0) >= 2]
     skipped = [p for p in fitted_params if 0 < combo_counts.get(p, 0) < 2]
     has_provenance_section = bool(qualifying) and not plottable_candidates.empty
+    has_scenarios = bool(config.pricing_scenarios)
 
     # TOC.
     lines.append("## Contents")
     lines.append("")
-    lines.append("- [Proposed parameters](#proposed-gas-parameters)")
+    if has_anchor:
+        lines.append("- [Proposed parameters](#proposed-gas-parameters)")
+    lines.append("- [Compute vs current gas](#compute-vs-current-gas)")
     lines.append("- [Client comparison](#client-comparison)")
     if has_provenance_section:
         lines.append("- [Worst-case provenance](#worst-case-provenance-per-gas-param)")
+    lines.append("- [Qualification](#qualification)")
+    if has_scenarios:
+        lines.append("- [Pricing scenarios](#pricing-scenarios)")
     lines.append("- [Warnings](#warnings)")
     lines.append("- [Poor-fit selections](#poor-fit-selections)")
     lines.append("")
 
-    lines.append("## Proposed gas parameters")
+    if has_anchor:
+        lines.append("## Proposed gas parameters")
+        lines.append("")
+        lines.append("| Gas param | Current gas | Proposed gas | Diff | Diff % |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for _, row in fitted_df.iterrows():
+            gas_param = str(row["gas_param"])
+            proposed = int(row["new_gas_rounded"])
+            if gas_param in current_values:
+                current_int = int(current_values[gas_param])
+                current_cell = str(current_int)
+                diff_cell = _signed_diff(proposed, current_int)
+                diff_pct_cell = _signed_pct(proposed, current_int)
+            else:
+                current_cell = SENTINEL
+                diff_cell = "n/a"
+                diff_pct_cell = "n/a"
+            lines.append(
+                f"| {gas_param} | {current_cell} | {proposed} | {diff_cell} | "
+                f"{diff_pct_cell} |"
+            )
+        lines.append("")
+
+    # Mandatory compute-vs-current-gas comparison — with or without an
+    # anchor. Without one this is the run's primary numeric table: measured
+    # cost against the active schedule, never a price.
+    lines.append("## Compute vs current gas")
     lines.append("")
-    lines.append("| Gas param | Current gas | Proposed gas | Diff | Diff % |")
-    lines.append("| --- | --- | --- | --- | --- |")
-    for _, row in fitted_df.iterrows():
-        gas_param = str(row["gas_param"])
-        proposed = int(row["new_gas_rounded"])
-        if gas_param in current_values:
-            current_int = int(current_values[gas_param])
-            current_cell = str(current_int)
-            diff_cell = _signed_diff(proposed, current_int)
-            diff_pct_cell = _signed_pct(proposed, current_int)
-        else:
-            current_cell = SENTINEL
-            diff_cell = "n/a"
-            diff_pct_cell = "n/a"
+    if has_anchor:
         lines.append(
-            f"| {gas_param} | {current_cell} | {proposed} | {diff_cell} | "
-            f"{diff_pct_cell} |"
+            "Measured worst-case runtime per parameter against the active "
+            "schedule. `Relative costliness` normalizes each param's "
+            "`runtime_ms / current_gas` by the median across params carrying "
+            "a current value — a unitless descriptive index, not a price."
         )
+    else:
+        lines.append(
+            "Comparison-only run: no pricing anchor was supplied, so no "
+            "proposed gas is computed. The table reports measured worst-case "
+            "runtime per parameter against the active schedule. `Relative "
+            "costliness` normalizes each param's `runtime_ms / current_gas` "
+            "by the median across params carrying a current value — a "
+            "unitless descriptive index, not a price."
+        )
+    lines.append("")
+    comparison_md = _comparison_table_md(proposal_output, config)
+    lines.extend(comparison_md)
     lines.append("")
 
     # Client comparison: worst vs. second-worst per gas param, plus heatmap.
@@ -833,6 +990,58 @@ def write_proposal_report(
         out_dir,
         plots_enabled=plots_enabled,
     )
+
+    # Qualification status of every planned model — always rendered.
+    lines.append("## Qualification")
+    lines.append("")
+    q = config.qualification
+    lines.append(
+        f"Policy — confidence level {q.confidence_level:.2f}; always-on gates: "
+        f"condition number ≤ {q.max_condition_number:.3g}, residual curvature "
+        f"R² ≤ {q.max_residual_curvature_r2:.3g}; armed gates: "
+        + (
+            f"relative CI width ≤ {q.max_relative_uncertainty:.3g}"
+            if q.max_relative_uncertainty is not None
+            else "relative CI width (unset)"
+        )
+        + ", "
+        + (
+            f"held-out error ≤ {q.max_holdout_error:.3g}"
+            if q.max_holdout_error is not None
+            else "held-out error (unset)"
+        )
+        + ", "
+        + (
+            f"min sessions {q.min_sessions}"
+            if q.min_sessions is not None
+            else "min sessions (unset)"
+        )
+        + ("; poor-fit thresholds enforced" if q.enforce_fit_quality else "")
+        + (
+            "; unqualified models blocked from recommended prices"
+            if q.block_unqualified
+            else ""
+        )
+        + "."
+    )
+    lines.append("")
+    qual_lines = _qualification_table_md(proposal_output.qualification_df)
+    lines.extend(qual_lines)
+    lines.append("")
+
+    # Optional explicit pricing scenarios — research outputs only.
+    if has_scenarios:
+        lines.append("## Pricing scenarios")
+        lines.append("")
+        lines.append(
+            "Each scenario applies its own explicit gas/second anchor and "
+            "margin policy. These are research outputs; nothing here alters "
+            "production constants, and no anchor is invented when none is "
+            "supplied."
+        )
+        lines.append("")
+        lines.extend(_scenarios_table_md(proposal_output, config))
+        lines.append("")
 
     # Warnings (with Missing parameters as a subsection — always shown).
     lines.append("## Warnings")

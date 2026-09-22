@@ -77,7 +77,8 @@ for the boilerplate.
 # schema version pin — required
 version: 1
 
-# anchor rate (gas/sec) — required
+# optional pricing anchor (gas/sec). Omit for a comparison-only analysis:
+# measured runtimes remain available, while proposed-gas columns stay empty.
 anchor_rate: 1.0e8
 
 # clients to include in the analysis — required, non-empty, no duplicates.
@@ -120,6 +121,28 @@ modeling:
   poor_fit_rsquared_threshold: 0.5  # optional, default 0.5
   random_seed: 42                   # optional, default 42 — controls bootstrap sampling
 
+# qualification and campaign controls
+qualification:
+  confidence_level: 0.95
+  max_condition_number: 1.0e8
+  max_residual_curvature_r2: 0.1
+  max_relative_uncertainty: null
+  max_holdout_error: null
+  min_sessions: null
+  enforce_fit_quality: false
+  block_unqualified: true
+campaign:
+  eligible_phases: [qualification, performance]
+  eligible_statuses: [executed]
+  correctness_column: correctness_passed
+  require_correctness_passed: true
+
+# optional, explicit economic scenarios. They never manufacture an anchor.
+pricing_scenarios:
+  - name: r7a_calibrated
+    anchor_rate: 1.0e8
+    margin_pct: 5
+
 # output controls
 output:
   plots: true              # default true; if false, reports omit plot embeds
@@ -149,10 +172,10 @@ models:
       model_params:
         target_coef: COLD_STORAGE_ACCESS
         update: STORAGE_WRITE
-    # precompile shape: synthetic target_operation + count_source escape hatch
+    # precompile shape: display target plus an address-specific semantic count
     - test_name: test_bls12_381
-      target_operation: BLS12_G1ADD            # display name in results.csv
-      target_operation_count_source: STATICCALL # where to read the opcount column
+      target_operation: BLS12_G1ADD
+      target_operation_count_source: PRECOMPILE_0x000000000000000000000000000000000000000b
       filter_by: [bls12_g1add]
       model_params:
         target_coef: PRECOMPILE_BLS12_G1ADD
@@ -189,43 +212,36 @@ Each model spec — whether bundled as a preset or written under
   fixtures (`opcode` → opcode is read from the fixture's `opcode_*` token).
   **Exactly one** must be set; setting both or neither is a config error.
 - `target_operation_count_source` — optional, only valid with
-  `target_operation`. Names an existing opcode column to read the per-fixture
-  opcount from when the target operation has no opcount column of its own.
-  This is the precompile escape hatch: precompiles (e.g. `BLS12_G1ADD`,
-  `ECADD`) are invoked via `STATICCALL` and have no dedicated mnemonic in
-  `opcounts.json`, so `target_operation` carries the precompile's display
-  name (used as the row identity in `results.csv` / `new_gas.csv`) while
-  `target_operation_count_source` names the actual column the invariant
-  (§2.3) is checked against. The field is scoped to the invariant check and
-  the glue detector's candidate set (§4.4) — it is **not** propagated to any
-  output artifact and never replaces `target_opcode` in downstream rows. Set
-  this only when no opcount column matches `target_operation`; for ordinary
-  opcode targets, leave it unset and the invariant defaults to
-  `target_opcode` itself.
+  `target_operation`. Names an existing count column to read the per-fixture
+  opcount from when the target operation has no opcode mnemonic of its own.
+  For a precompile it is **always**
+  `PRECOMPILE_0x<40 lowercase hexadecimal address>` (for example
+  `PRECOMPILE_0x000000000000000000000000000000000000000b` for BLS G1 add).
+  That semantic counter records invocations of that destination address;
+  `STATICCALL` counts wrappers and is never a precompile target counter.
+  `target_operation` remains the readable output identity while the count
+  source is used only for the invariant and excluded from glue detection.
+  Ordinary opcode targets leave the field unset and use `target_opcode`.
 - `overhead_baseline_param` — optional, a raw fixture-param name (resolved to
   `param_<name>` like `model_by`). When set, every fixture where that param
   is `"False"` is paired against the mean runtime of its `"True"`
-  counterparts (same params otherwise, same client — see §4.3 for the
-  repeated-trial aggregation) and the spec's `target_coef` is fit on the
-  runtime *delta* instead of raw `False` runtime. This is for benchmark
-  suites that ship an explicit A/B
-  baseline fixture — one that runs the surrounding harness without the
-  target opcode — as a model-free control: the delta cancels, for free and
-  without needing a per-opcode driver fit, anything whose *count* is
-  identical between the two variants (known glue opcode or not). A `False`
-  row with no matching `True` row is a config error. The pairing transform
-  (§4.3) is applied to every opcode-count column, not just runtime, so the
-  glue detector (§4.4) runs on the same delta rather than being skipped: a
-  contaminant that scales with the target's own opcount instead of staying
-  identical — e.g. a calling convention (GAS for a gas stipend, PUSHes for
-  call arguments) that the `True` baseline drops along with the target op —
-  does not cancel on its own, but survives the diff and is still detected and
-  priced by the ordinary per-opcode mechanism. A spec can therefore set this
-  field even when the target opcode's own calling convention differs between
-  variants, as long as that convention is one of the 30 priced canonical
-  names (`glue/required.py`); a differing count that is *not* one of those
-  30 names would still fold into `target_coef` uncorrected, same as it would
-  in a spec that doesn't use this field at all.
+  counterparts (same client and session — see §4.3 for repeated-trial
+  aggregation) and the spec's `target_coef` is fit on the runtime *delta*
+  instead of raw `False` runtime. This is for benchmark suites that ship an
+  explicit A/B control which runs the harness without variable work. The
+  pairing transform (§4.3) differences runtime, `opcount`, and every opcode
+  count, so the post-pair invariant describes the target work added beyond
+  the control even when a production system tail executes a nonzero fixed
+  count on both sides.
+- `overhead_baseline_match_params` — optional raw fixture-param names used as
+  the control's shape key. `null` (the default) preserves legacy matching on
+  every other populated parsed parameter. `[]` matches only the mandatory
+  client and session keys; a nonempty list matches only those named shape
+  parameters plus the mandatory keys. It is valid only with
+  `overhead_baseline_param`, cannot contain that baseline flag or duplicates,
+  and every named parameter must exist on the selected fixtures. Use it when
+  control and measured fixture IDs intentionally encode different sweep
+  values, such as a zero-work control versus an `input_length` sweep.
 - `filter_by` — string or list of strings, ANDed as substring matches against
   the raw fixture name. A `!`-prefixed token inverts the match: `!foo`
   requires that `foo` is absent from the fixture name. Scalar inputs are
@@ -274,14 +290,19 @@ client_name, fixture_name, test_runtime_ms
 is the measured runtime of one fixture run, in milliseconds, and serves as the
 LHS of every regression in §4.
 
-Extra columns are passed through into the parsed dataframe and are available as
-group columns if referenced from `model_by` (this is forward-compat — today the
-parser is the only source of params).
+Extra columns pass through unchanged but are not implicit regressors. Campaign
+exports may add `session_id`, `sample_id`, `phase`, `status`, `repetition`,
+`correctness_passed`, and arbitrary numeric bookkeeping metadata. Only fields
+named by a model spec become design features; baseline pairing differences only
+`test_runtime_ms` and opcount JSON columns, never these metadata fields.
 
-Duplicate rows for the same `(client_name, fixture_name)` are **not deduplicated** —
-each row is an independent runtime observation and is fed to the regression as
-its own data point. Loaders do not warn or collapse on duplicates; tests
-typically include them on purpose to model measurement noise.
+When both configured `phase` and `status` columns exist, the loader writes an
+`eligibility.csv` ledger for every input row and calibrates only rows whose
+phase/status are in `campaign.eligible_phases` / `eligible_statuses`. If the
+configured correctness column exists and `require_correctness_passed` is true,
+only true-like values (`true`, `1`, `yes`) are eligible. The default admits
+only executed qualification/performance measurements. A three-column legacy
+CSV remains fully supported and receives no campaign filtering.
 
 `GasFit.load_runtimes` restricts the parsed frame to rows whose `client_name`
 appears in `config.clients` (§2.1). Configured clients absent from the CSV
@@ -301,23 +322,19 @@ dropped before any downstream stage sees them.
 }
 ```
 
-`opcount` is the count of the **target** opcode (the regressor for that fixture).
-The remaining keys are the full per-opcode counts (used by glue adjustment).
-Per-opcode keys are the EVM opcode mnemonics in upper-case (e.g. `"ADD"`,
-`"SLOAD"`, `"STATICCALL"`).
+`opcount` is the count of the **target work** (the regressor for that fixture).
+For normal opcode targets the remaining keys are EVM mnemonic counts used by
+glue adjustment. Precompile invocation counts are additional semantic keys of
+the exact form `PRECOMPILE_0x<40 lowercase hexadecimal address>`; they are
+not opcode mnemonics and are excluded from glue candidates.
 
-**Invariant:** for every fixture, `opcount` equals the count under the
-**count-source** opcode's mnemonic key. The count source is normally the
-resolved `target_opcode` itself — i.e. for a fixture whose `target_opcode` is
-`SLOAD`, `data[fixture_name]["opcount"] == data[fixture_name]["SLOAD"]`. When
-the spec sets `target_operation_count_source` (§2.1, used for precompiles),
-the invariant is checked against that opcode column instead — e.g. for a
-BLS12 precompile spec with `target_operation: BLS12_G1ADD` and
-`target_operation_count_source: STATICCALL`,
-`data[fixture_name]["opcount"] == data[fixture_name]["STATICCALL"]`. The
-opcounts loader has no spec context, so the equality is enforced at
-model-estimation time and raises a config error naming the offending fixture
-if the two disagree.
+**Invariant:** `opcount` equals the configured count source. Usually that is
+the resolved `target_opcode` (for `SLOAD`,
+`data[fixture]["opcount"] == data[fixture]["SLOAD"]`). For BLS G1 add it is
+instead `PRECOMPILE_0x000000000000000000000000000000000000000b`, so the
+same equality is checked against the destination-specific counter rather than
+the total `STATICCALL` count. The loader has no spec context, so this check
+runs at model estimation and names any offending fixture.
 
 **Missing per-opcode keys** in any fixture's inner dict are treated as zero
 counts (sparse JSON is supported, no warning emitted). This applies to
@@ -332,14 +349,19 @@ When loading this data, the "<fixture_name>" field should go into a column named
 ### 2.4 Gas-cost defaults
 
 `ethereum/execution-specs` is an **optional extra**
-(`pip install -e ".[specs]"`); when installed, its `vm.gas.GasCosts` is the
-source of truth for each fork (one class per fork module, e.g.
-`ethereum.osaka.vm.gas.GasCosts`). When not installed,
-`evm_gasfit/defaults/_fallback.py` provides a single bundled fork — currently
-`osaka`, mirroring the public integer attributes of the upstream `GasCosts` —
-as a Python literal so the package is fully functional without the extra. The
-defaults module probes for the extra at import time and selects one source for
-the whole run — the two paths are never mixed.
+(`pip install -e ".[specs]"`). The loader first supports the current source-tree
+module path `ethereum.forks.<fork>.vm.gas.GasCosts`, then the older packaged
+compatibility path `ethereum.<fork>.vm.gas.GasCosts`. One complete source backs
+each run; the paths are never merged.
+
+Without the extra, `evm_gasfit/defaults/_fallback.py` bundles separate
+`prague` and legacy `osaka` tables. Prague is an explicit literal transcribed
+from `execution-specs/src/ethereum/forks/prague/vm/gas.py::GasCosts`: it keeps
+only Prague fields and values, including Prague's blob target and fee-update
+fraction. It deliberately excludes Osaka-only access-list scheduling fields,
+`OPCODE_CLZ`, and the P256 precompile. The catalog's BLAKE2F base component is
+represented as zero because Prague charges only its per-round term. Osaka
+remains unchanged for historical analyses.
 
 The selected source is logged once at startup at `INFO` on the
 `evm_gasfit.defaults` logger (`"gas costs: fork=<name>, source=execution-specs"`
@@ -466,16 +488,14 @@ account/storage/state, hashing, system, and all bn128 / bls12-381 precompiles):
 | `cold_account_code_access` | `test_account_access` | param `opcode` | `COLD_ACCOUNT_CODE_ACCESS`, `ACCOUNT_WRITE` |
 | `cold_storage_sload` | `test_sload_bloated` | `SLOAD` | `COLD_STORAGE_ACCESS` |
 | `keccak` | `test_keccak_diff_mem_msg_sizes` | `KECCAK256` | `OPCODE_KECCAK256_BASE`, `OPCODE_KECCAK256_PER_WORD` (via `bytes_to_words`) |
-| `precompile_bls_g1add` | `test_bls12_381` | `BLS12_G1ADD` (count via `STATICCALL`) | `PRECOMPILE_BLS_G1ADD` |
+| `precompile_bls_g1add` | `test_bls12_381` | `BLS12_G1ADD` (count via `PRECOMPILE_0x...000b`) | `PRECOMPILE_BLS_G1ADD` |
 
-The last row illustrates the precompile shape: `target_operation` carries the
-precompile's display name (used as `target_opcode` in all output rows),
-`target_operation_count_source: STATICCALL` tells the §2.3 invariant which
-column actually backs `opcount`, and `filter_by` picks the variant out of the
-shared `test_bls12_381` fixture pool (e.g. `[bls12_g1add]`). The same shape
-covers the other BLS12 precompiles (`G2ADD`, `FP_TO_G1`, `FP_TO_G2`, …) and
-the BN128 precompiles (`ECADD`, `ECMUL`, `ECPAIRING`) on
-`test_alt_bn128` / `test_alt_bn128_uncachable`.
+The precompile shape keeps `target_operation` as the readable output identity.
+Its count source is the destination-specific semantic key
+`PRECOMPILE_0x<40 lowercase hexadecimal address>`; for BLS G1 add it ends in
+`000b`. This invariant deliberately does not use `STATICCALL`, whose total
+includes wrapper calls to other destinations. The count source and all
+`PRECOMPILE_` keys are excluded from glue candidates.
 
 Preset definitions are auto-rendered into the docs site via mkdocstrings
 (§11); no CLI inspection subcommand ships (`evm-gasfit run` stays purely I/O
@@ -616,21 +636,27 @@ Scoping and validation:
   - `ConfigError` — raised by `load_config()` for every §2.5 / §4.8 hard error
     (unknown fork field, malformed derived formula, missing required test, etc.).
     CLI catches it and exits 1.
-  - `ModelingError` — raised when fitting produces zero usable rows for the
-    whole run (every spec was skipped). CLI catches it and exits 2. Per-spec
-    skips are warnings, not errors — only a fully empty output trips this.
+  - `ModelingError` — raised when a legacy (non-campaign) fitting run produces
+    zero usable rows (every spec was skipped). CLI catches it and exits 2.
+    Per-spec skips are warnings, not errors. A campaign input carrying the
+    phase, status, and correctness fields instead completes with an empty,
+    schema-correct `results.csv`, its full inconclusive qualification ledger,
+    and unresolved no-fit proposal rows when eligibility admits no fixtures.
 - **Determinism.** Given identical inputs and the same `random_seed`, all CSV
-  and markdown outputs are byte-identical across runs and across platforms.
+  outputs and all Markdown content except the generation-time UTC timestamp in
+  `new_gas_proposal.md` are byte-identical across runs and across platforms.
   Pandas writes use a fixed column order and `lineterminator="\n"`; bootstrap
   sampling threads the configured seed into every `numpy.random.Generator`.
-  Figure files (`figs/*.png`) are not promised byte-identical — matplotlib
-  embeds non-semantic metadata — but their data content is deterministic.
+  Figure files (`figs/*.png`) are not promised byte-identical because matplotlib
+  embeds non-semantic metadata, but their data content is deterministic.
 
 ### 4.1 Fixture-name parser
 
-Hard requirement: EEST `key_value-key_value-…` convention (inside the `[…]`).
-The bracketed content is split on `-`. Each resulting token containing at
-least one `_` is parsed as `key_value` by splitting on the **last** `_`, so
+Accept both legacy `file.py__test[...]` names and pytest
+`path/file.py::test[...]` node IDs, retaining the file basename. Split the
+bracketed EEST parameter content on `-`. Within each `key_value` token, split
+at the first `_` whose suffix starts with an uppercase letter or digit;
+if no such boundary exists, fall back to the first `_`. Thus
 `opcode_ADD` yields `opcode = ADD`, `cache_strategy_NO_CACHE` yields
 `cache_strategy = NO_CACHE`, and `block_limit_million_30` yields
 `block_limit_million = 30`. Tokens with no `_` (`10GB`, `benchmark`) become
@@ -641,18 +667,18 @@ Params extracted into named columns on `fixtures_df` for every row:
 
 - Always: `test_name`, `test_file`. Every parsed `key_value` token also lands as
   its own (string-valued) column under the name `param_<key>` — the parser is
-  name-agnostic and does not coerce any specific param to a numeric type. Specs
-  that need a numeric value declare it via `fixture_params:` (§2.7), which
-  handles the coercion per-spec. The `param_` prefix prevents collisions with
-  opcode-mnemonic columns from the opcounts merge: a token like `SSTORE_same`
-  parses to `{SSTORE: same}` under the partition fallback, and without the
-  prefix the resulting `SSTORE` column would clash with the `SSTORE` opcode
-  count and be split into `SSTORE_x`/`SSTORE_y` by the merge. Spec authors
-  write logical names (`opcode`, `mem_size`); the resolver translates them.
-- For each model spec: the params named in `model_by` (one column each) and a
-  `filter_by` column built by joining the matched `filter_by` tokens with `-`.
-- `target_opcode` is filled per row by either the literal `target_operation` or by
-  reading `target_operation_param` from the parsed params.
+  name-agnostic and does not coerce any specific param to a numeric type. A
+  runtimes CSV may also carry an explicit `param_<key>` column for canonical
+  workload parameters omitted from its fixture ID. Where both sources provide
+  a value for the same fixture, they must agree; equal values are coalesced
+  into one column and conflicting facts are a `ConfigError`, never pandas
+  `_x`/`_y` columns. Specs that need a numeric value declare it via
+  `fixture_params:` (§2.7), which handles coercion per-spec. The `param_`
+  prefix prevents collisions with opcode-mnemonic columns from the opcounts
+  merge: a token like `SSTORE_same` parses to `{SSTORE: same}` under the
+  partition fallback, and without the prefix the resulting `SSTORE` column
+  would clash with the `SSTORE` opcode count. Spec authors write logical names
+  (`opcode`, `mem_size`); the resolver translates them.
 
 EEST has used more than one convention for the scan-axis token (older fixtures
 emit `block_limit_million_<N>`; newer ones use `benchmark_<N>M` or other
@@ -711,8 +737,8 @@ contributes no row to `results.csv`:
   never reaches the fit-or-skip path.
 - `scipy.optimize.nnls` itself raises (numerical convergence failure).
 
-If every fit for the entire run is skipped, the run produces zero rows in
-`results.csv` and raises `ModelingError` per §4.0 (CLI exit 2).
+If every fit for a legacy (non-campaign) run is skipped, the run produces zero
+rows in `results.csv` and raises `ModelingError` per §4.0 (CLI exit 2).
 
 **Bootstrap-iteration failure mode.** Per-iteration `scipy.optimize.nnls` calls
 inside the bootstrap loop can raise even when the primary fit succeeds (e.g.
@@ -732,14 +758,60 @@ Coefficients the primary fit pins at zero are reported with p = 1.0
 (unidentifiable). The Wald-style alternative is tracked in
 [issue #6](https://github.com/misilva73/evm-gasfit/issues/6).
 
+#### 4.2a Session-aware inference and qualification
+
+When `session_id` is present, bootstrap resampling is by session cluster:
+each draw samples whole sessions with replacement and retains every workload
+row in each selected session. One session retains its point estimate but has
+no cluster-bootstrap uncertainty and is inconclusive; the estimator never
+falls back to row resampling when session metadata exists. Without
+`session_id`, the legacy row bootstrap remains the compatibility behavior.
+
+Each planned `(spec, model_by combination, client)` gets exactly one
+`qualification.csv` row, even if it matched no fixtures or could not be fit.
+`qualified` requires all enabled gates; missing fixtures, insufficient
+observations, rank-deficient designs, constant target counts, unavailable
+holdout evidence, and a conditional supporting-cost interval are
+`inconclusive`. A primary solver failure is `failed`. `results.csv` contains
+successful fits only; the qualification ledger is the complete audit trail.
+
+The evidence stored per planned model is the column-normalized condition
+number, residual-curvature R², bootstrap CI width at
+`qualification.confidence_level`, number of sessions, leave-one-session-out
+relative prediction error, and leave-one-distinct-workload-point-out relative
+prediction error. Holdout refits must retain full rank; otherwise their
+evidence is unavailable rather than spuriously optimistic. Residual curvature
+uses ordinary least squares solely as a signed-residual diagnostic, while the
+price fit remains SciPy NNLS.
+For session-aware campaign inputs, `max_condition_number` and
+`max_residual_curvature_r2` are always checked. The optional
+`max_relative_uncertainty`, `max_holdout_error`, `min_sessions`, and
+`enforce_fit_quality` gates arm only when configured. Legacy inputs without
+session metadata retain their established row-bootstrap pricing behavior. With
+`block_unqualified: true`, only campaign estimates that are inconclusive or
+failed leave recommended price columns empty.
+
+When campaign eligibility admits zero fixtures, the run still emits the empty
+successful-fit schema, one inconclusive qualification record for every planned
+`(spec, client)` pair, and unresolved proposal rows for every configured gas
+parameter. The eligibility ledger retains the excluded rows; neither a
+synthetic fit nor a recommended price is created.
+
 ### 4.3 Model formula
 
-For a given model spec with `model_params = {target_coef: G0, x1: G1, x2: G2, …}`:
+For a given model spec with `model_params = {target_coef: G0, x1: G1, …}` and
+optional `setup_params = {s1: H1, …}`:
 
 ```
-test_runtime_ms = intercept + target_coef·opcount + Σ_i x_i·opcount·param_i
+test_runtime_ms = intercept + target_coef·opcount
+                  + Σ_i xi·opcount·param_i + Σ_j sj·setup_param_j
 ```
 
+`setup_params` names n-independent fixture features: its coefficient is not
+multiplied by `opcount`. It is for a real setup cost that varies by workload
+(such as a length in words), not an implicit fallback for an omitted target
+feature. Its keys share the coefficient namespace with `model_params` and
+cannot collide with `target_coef` or a model-param key.
 `test_runtime_ms` is the measured per-fixture runtime (§2.2). `intercept`,
 `target_coef`, and each `x_i` are fitted coefficients in milliseconds; they
 land on `results.csv` as `intercept_runtime_ms`, `target_coef_runtime_ms`, and
@@ -748,32 +820,25 @@ land on `results.csv` as `intercept_runtime_ms`, `target_coef_runtime_ms`, and
 `<param>_conf_int_low`, …) since those stats are not in ms.
 
 - `target_coef` is reserved and always maps the bare `opcount` coefficient.
-- All other keys must be fixture-param names; the corresponding feature is
-  `opcount · param_value` (param values are coerced to float at parse time).
-- **One-value extras**: if a non-`target_coef` feature has only one unique value across
-  the filtered fixtures, drop it from the design matrix and log a warning naming
-  the model spec and the feature. Continue with the remaining features.
 - **Baseline pairing**: if a spec sets `overhead_baseline_param` (§2.1), the
-  filtered slice is transformed *before* the §2.3 opcount invariant runs
-  (every `overhead_baseline_True` row has `opcount == 0`, which that
-  invariant otherwise rejects): `"True"` rows are aggregated to one mean row
-  per every other parsed param (plus client) — benchmark suites commonly
-  repeat the same fixture across several trials, so this compares each
-  individual `"False"` trial against a lower-variance baseline estimate
-  rather than an arbitrary single `"True"` trial — then each `"False"` row's
-  `test_runtime_ms` **and every per-opcode count column** becomes the
-  difference against its matching aggregated baseline (`opcount` itself is
-  left untouched — it's the regression's x-axis and the glue detector's
-  correlation reference, not a contaminant), and the `"True"` rows are
-  dropped. A `"False"` row whose param combination has no `"True"`
-  counterpart at all is a `ConfigError`. The rest of the fit — grouping by
-  `model_by`, building the design matrix, NNLS — runs unchanged on the
-  transformed slice, including repeated `"False"` trials, which still
-  contribute independent observations. Diffing every count column, not just
-  runtime, is what lets the glue detector (§4.4) run on baseline-paired specs
-  instead of being skipped: an opcode with an identical count on both sides
-  deltas to a constant and fails detection on its own, while one that scales
-  with the target's own opcount survives the diff untouched.
+  filtered slice is transformed before the §2.3 opcount invariant runs.
+  `"True"` rows are aggregated to one mean row per configured shape key,
+  client, and session. With `overhead_baseline_match_params: null`, the shape
+  key is every other populated parsed parameter; `[]` leaves only client and
+  session; an explicit list uses only those named parameters. This preserves
+  strict legacy identity by default while admitting zero-work controls whose
+  fixture ID carries a different sweep value.
+
+  Each `"False"` row's `test_runtime_ms`, `opcount`, and every per-opcode count
+  becomes the difference against its matching aggregated baseline, then the
+  `"True"` rows are dropped. The target-count invariant therefore validates
+  only the variable work above the control; a fixed production system tail
+  present on both sides is removed instead of causing a false mismatch. A
+  `"False"` row whose selected shape has no `"True"` counterpart is a
+  `ConfigError`. Repeated `"False"` trials remain independent observations.
+  Diffing every count column lets the glue detector (§4.4) run on
+  baseline-paired specs: an identical count deltas to a constant and fails
+  detection, while one that scales with the target's variable work survives.
 - **Empty specs**: if `test_name` plus `filter_by` leaves zero matching fixtures
   for a spec, skip that spec entirely and log a warning to stderr naming the
   `test_name` and the filter that excluded everything. The pipeline continues
@@ -917,27 +982,17 @@ so a single `glue_opcode == "DUP"` row is emitted instead of one per
 member. The result aligns directly with `glue_results.csv`, which also keys
 on canonical names.
 
-Per-fixture glue ratios are computed the same way as today
-([src/glue.py::get_glue_opcodes_by_test](https://github.com/misilva73/evm-gas-repricings/blob/main/src/glue.py)):
-
-- Group by `(test_name, target_opcode, *model_by)` — **no client axis**. Opcode
-  counts are a property of the fixture (compiled bytecode + inputs), not of the
-  client running it, so within a group the per-fixture rows are deduplicated on
-  `fixture_name` and the ratio table is computed once on those rows, then
-  reused unchanged across every client in the adjustment formula below.
 - Drop groups with fewer than 5 distinct fixtures. The scan axis is implicit in
   the rows — whatever EEST varies across the fixtures (block limit, message
   size, num pairs, …) — and no specific param name is referenced.
-- For every non-target opcode column, compute Pearson correlation with `opcount`
-  across the (opcount-sorted) per-fixture rows. Keep opcodes with
-  `corr ≥ 1 − eps`, where `eps` comes from `glue_adjustment.ratio_corr_eps`
-  (config, default 0.05), and `mean(diff(count)) / mean(diff(opcount)) ≥ 5e-4`.
-- For specs whose `target_operation_count_source` is set (§2.1, precompiles),
-  the count-source column is also excluded from the candidate set — the
-  invariant guarantees `count_source == opcount` row-for-row, so it would
-  match every threshold trivially and pollute the glue table with a
-  STATICCALL = 1.0 entry for every precompile target. That column counts the
-  work being measured, not glue.
+- Candidate counts are restricted to columns from `opcounts.json`, not numeric
+  runtime metadata. For every non-target EVM opcode column, compute Pearson
+  correlation with `opcount` across the opcount-sorted fixtures and keep
+  `corr ≥ 1 − eps` with
+  `mean(diff(count)) / mean(diff(opcount)) ≥ 5e-4`.
+- A configured count source is excluded because the invariant makes it equal
+  to `opcount`. Every `PRECOMPILE_0x...` semantic invocation key is also
+  excluded: it measures target work by destination address, never opcode glue.
 
 The adjustment is computed per `results.csv` row and the resulting table is
 keyed by `(source_label, test_name, target_opcode, *model_by, client_name)` —
@@ -957,11 +1012,14 @@ Only glue opcodes whose fit passed both gates contribute: `p_value <
 glue_contribution_p_value_threshold` (default 0.05) **and** `rsquared >=
 glue_contribution_rsquared_threshold` (default 0.5). A glue fit that fails
 either gate has its contribution skipped — the target coefficient is left
-holding that glue's runtime — so a noisy glue fit cannot pull the target
-down on the strength of a slope it never measured reliably. Negative
-adjusted coefficients are clipped to zero. The CI bounds on
-`target_coef_runtime_ms` are shifted by the same adjustment and clipped
-identically.
+holding that glue's runtime — so a noisy glue fit cannot pull the target down.
+When target and contributing glue fits share the same complete session set,
+their cluster-bootstrap replicates are paired by stable session-ID draw and
+replicate index; failed refits remain aligned and cannot be silently dropped.
+Genuinely disjoint session sets may use independent marginal draws. Any
+partial/shared-but-unsynchronizable session overlap, missing cluster identity,
+or unavailable supporting draw leaves the point-shifted interval conditional
+and the adjusted estimate inconclusive.
 
 **Missing-glue warning.** "Uses a glue opcode" is defined operationally: for a
 fitted model's `(test_name, target_opcode, *model_by)` group, run the same
@@ -989,12 +1047,13 @@ detected and priced exactly as it would be for a spec that doesn't use
 baseline pairing at all.
 
 ### 4.5 Time units
-
-All `*_runtime_ms` columns are in milliseconds. `anchor_rate` is in
-gas/second, so the per-opcode gas conversion is
-`new_gas_decimal = anchor_rate · runtime_ms / 1000`, where `runtime_ms` is
-the per-opcode ms cost selected for that `(gas_param, client)` row (§4.6).
-
+All `*_runtime_ms` columns are in milliseconds. When an explicit
+`anchor_rate` is supplied (gas/second), conversion is
+`new_gas_decimal = anchor_rate · runtime_ms / 1000`. Without an anchor,
+`new_gas_decimal` and `new_gas_rounded` are null: the analysis remains a
+compute-vs-current-gas comparison and never borrows an anchor from another
+fork. `pricing_scenarios` are explicit anchor-plus-margin alternatives; only
+qualified rows receive a scenario gas value.
 ### 4.6 Coefficient → gas mapping
 
 For every `(model_spec, model_by-combo, client)` row in `results_df`, expand into
@@ -1179,11 +1238,15 @@ identifier errors fire mid-pipeline.
 
 | File | Always written | Notes |
 | --- | --- | --- |
-| `results.csv` | yes | one row per `(model_spec, model_by-combo, client)`; no `glue_adjustment` column (that lives on `new_gas_all_params.csv`) |
-| `glue_results.csv` | iff glue enabled | per `(client, glue_opcode)`: `nobs, glue_runtime_ms, p_value, rsquared` |
-| `glue_opcodes_by_test.csv` | iff glue enabled | per `(test, target_opcode, *model_by)`: `glue_opcode, corr, ratio` |
-| `new_gas_all_params.csv` | yes | every per-client candidate fit (one row per `(gas_param, client, test, target_opcode, model_coef_name, model_by-combo, source_label)`), with the per-client worst-case pick flagged `is_winner`; columns include `gas_param, client_name, runtime_ms, pvalue, conf_int_low, conf_int_high, test_name, target_opcode, model_coef_name, source_label, glue_adjustment, *model_by, rsquared, rsquared_adj, new_gas_decimal, new_gas_rounded, poor_fit, is_winner`. `source_label` names the producing spec (`presets[<name>]` / `models.custom[<i>]`) and disambiguates candidates that are otherwise identical — e.g. two specs differing only in `filter_by`; placeholder/derived rows carry the `<no-fit>` / `<derived>` sentinel. `is_winner` is `true` on the single row the per-client selector picked for each `(gas_param, client_name)` (false on losing candidates and on placeholder/derived rows). `poor_fit` is `true` on **every** candidate that failed a fit-quality gate (`pvalue >= poor_fit_p_value_threshold` or `rsquared < poor_fit_rsquared_threshold`), not just winners. `pvalue` is the p-value of the regression coefficient identified by `model_coef_name` on the source `results.csv` row (i.e. `target_coef_pvalue` when `model_coef_name == "target_coef"`, else `<model_coef_name>_pvalue`). The CI bounds come from the same coefficient. `rsquared` and `rsquared_adj` are carried verbatim from the source `results.csv` row (regression-level, identical across coefficient expansions of one source row). `new_gas_rounded` is a nullable integer column; unresolved (no-fit) rows leave it empty (§4.6). |
-| `new_gas.csv` | yes | worst-case across clients; one row per gas param; columns include `gas_param, client_name, runtime_ms, conf_int_low, conf_int_high, selected_test, selected_opcode, selected_model_coef_name, glue_adjustment, *model_by, new_gas_decimal, new_gas_rounded`. `new_gas_rounded` is a nullable integer column; unresolved rows leave it empty (§4.6). |
+| `results.csv` | yes | one row per successful `(model_spec, model_by-combo, client)` fit; condition number and session count are carried with coefficients |
+| `glue_results.csv` | iff glue enabled | per `(client, glue_opcode)` fit with bootstrap evidence |
+| `glue_opcodes_by_test.csv` | iff glue enabled | opcode-only glue candidates; runtime metadata and semantic precompile counters are excluded |
+| `new_gas_all_params.csv` | yes | every per-client fitted candidate, its raw or propagated-adjusted interval, qualification status, and winner flag |
+| `qualification.csv` | yes when modeling begins | one auditable row for every planned model: qualified, inconclusive, or failed, with gate evidence and reasons |
+| `eligibility.csv` | iff campaign phase/status metadata exists | every runtime input row with eligibility and an exclusion reason; excluded rows are retained here but never fitted |
+| `compute_gas_comparison.csv` | yes | measured worst-case runtime relative to current gas without requiring a pricing anchor |
+| `pricing_scenarios.csv` | iff scenarios configured | explicit anchor-plus-margin prices for qualified estimates only; unqualified prices are empty |
+| `analysis_status.json` | yes | immutable archive record: raw config document and hash, input/output hashes, manifest, policy, and every planned-model status with its exact `model_by` group values; non-finite evidence is JSON `null` |
 | `runtime_estimation_autogenerated_report.md` | yes | per-spec regression report. Opens with a `## Contents` bulleted list (one bullet per `target_opcode` in first-appearance order across specs, anchors GFM-compatible). Each target opcode gets a `## <opcode>` section; within it, each `(test_name, model_by-combo, source_label)` has a headline `### <test_name>` (with optional `— combo <combo>` suffix, plus a `— <source_label>` suffix only when two specs share the same `(test_name, combo)` so their blocks stay distinct), the cross-client headline metrics table, and one `<details>` block per client with summary `"<client> — NNLS regression summary"` wrapping the NNLS summary plus, when `output.plots: true`, the three per-fit plot embeds (regression, bootstrap, diagnostics). |
 | `glue_opcodes_autogenerated_report.md` | iff glue enabled | per-client joint regression summary; plots embedded iff `output.plots: true` |
 | `new_gas_proposal.md` | yes | final proposal, diff vs. patched fork values + `new_params` integer defaults (§4.6) with "no prior default" sentinel for `new_params` entries declared as `null`. Anchor rate is rendered as `<N> Mgas/s` (3 significant figures over `anchor_rate / 1e6`) in the run-metadata line. Opens with a `## Contents` heading followed by a markdown bullet list — one bullet per top-level section in render order, anchors GFM-compatible; the Worst-case provenance bullet is included only when that section renders. Sections, in order: `## Proposed gas parameters` diff table with columns `gas_param \| current_gas \| proposed_gas \| diff \| diff %` (column headers are title-cased — `Gas param`, `Current gas`, `Proposed gas`, `Diff`, `Diff %`) and fitted rows only; `## Client comparison` (one combined table with one row per gas_param: worst client + value, second-worst client + value, and a `Ratio` column `worst gas / second-worst gas` formatted as `1.23×` — values near `1×` mean the worst case sits next to the rest of the field, large ratios flag the worst client as an outlier; renders `n/a` when the second-worst value is `0`; gas params fitted by a single client are omitted; an overview of per-client proposed values follows the table — as the `figs/proposal/heatmap.png` embed colored by `log2(proposed / current)` when `output.plots: true`, or as a markdown table — gas params as rows in config-declaration order, clients as columns alphabetically, cells = `new_gas_rounded`, blank where a (param, client) pair has no fit — when `output.plots: false`); `## Worst-case provenance per gas param` (rendered whenever at least one gas param carries ≥ 2 distinct model combos in the per-client candidate pool — including losing candidates, *not* just the per-client winners — irrespective of `output.plots`), with one `<details>` block per qualifying gas_param — each block embeds the per-param heatmap (`figs/proposal/provenance__<gas_param>.png`) with clients on the x-axis and model combos on the y-axis, cells carrying every candidate's `new_gas_rounded` (winning and losing) colored by `log2(proposed / current)` against that param's current baseline using the same per-param symmetric `±max(|log2|)` scale (floored at `±1`) as the overview heatmap when `output.plots: true`, or a markdown table sharing the same combo-labeling logic (combo rows × client columns, cells = every candidate's `new_gas_rounded`) when `output.plots: false`; either way, the (combo, client) cell that the per-client selector picked as that client's worst-case is highlighted — outlined in black on the heatmap, rendered in `**bold**` in the markdown table; gas params with only one distinct combo are listed in a single italic line at the top of the section; `## Warnings` containing `### Missing parameters` (always present — `_None._` body when empty; lists no-fit / None-derived rows), `### Incomplete client coverage` (always present — `_None._` body when empty; the expected client universe is `config.clients` (§2.1), not whichever clients happened to fit; when any configured client produced zero estimations across all parameters, a `Clients with no estimations at all:` bold callout listing those clients renders above the per-param table; the table itself lists one row per gas_param fit for at least one configured client but missing on others, with the missing clients listed — a fully-missing client therefore appears both in the callout and in every per-param row), `### Missing glue adjustments` (when populated; renders one or both of two sub-blocks under the single heading, each wrapped in its own `<details>` block with a summary carrying a one-line count so the heading collapses to two summary lines by default: (a) non-priced opcodes that correlate with target opcounts — §4.4 missing-glue warnings; summary reads `Non-priced opcodes correlated with the target opcount — N tests affected`; (b) priced glue opcodes whose per-client fit failed the glue gating thresholds (`glue_contribution_p_value_threshold` or `glue_contribution_rsquared_threshold` — the same gates `compute_glue_adjustment` uses), with one row per glue opcode listing the failing clients (each tagged `p-value`, `R²`, or `both` per §4.6's label convention) and the gas params whose target_coef adjustment depends on that glue opcode — derived by joining `glue_opcodes_by_test.csv` against the per-client `target_coef` candidate pool on `(test_name, target_opcode, *model_by)`; summary reads `Priced glue opcodes with a poor fit — N (glue_opcode, client) fits skipped`; because rows surface here only when their contribution was skipped, the listed gas params' target coefficient on the affected clients is *not* net of this glue opcode's runtime), and `### Other` (when populated; config-load warnings from §2.5 and anything else); `## Poor-fit selections` containing `### Winners with poor fit` (rows on `new_gas_all_params.csv` where `is_winner = true` **and** `poor_fit = true` — winners selected via the fallback branch because they failed at least one threshold; one row per `(gas_param, client)` with a `Failed` cell naming the failing threshold(s): `p-value`, `R²`, or `both`) and `### Other weak candidates` (rows that lost the per-client selection — `is_winner = false` — but failed at least one threshold; they appear on `new_gas_all_params.csv` too and are sliced out via the `is_winner` flag; rendered as one `<details>` block per gas_param with summary `<gas_param> — N weak combos`, body table with columns `Test`, `Target opcode`, `Coef`, `Combo`, `Failing clients` where each row collapses every failing client for that combo into one cell, each tagged `(p-value)` / `(R²)` / `(both)`, and `Combo` shows only the `model_by` factors that vary within the block as `k=v / k=v`, or `—` when none vary). Both subsections render `_None._` when empty. |
@@ -1358,26 +1421,24 @@ evm-gasfit run \
     --config tests.yaml \
     --runtimes runtime.csv \
     --opcounts opcounts.json \
+    --manifest campaign-manifest.json \
     --out ./out
+
+evm-gasfit compare-campaigns \
+    --baseline ./baseline-out \
+    --candidate ./candidate-out \
+    --out ./comparison-out
 ```
 
-All behavioral flags (anchor rate, fork, glue toggle, plots, thresholds, derived
-params) live in the YAML — the CLI is purely I/O paths plus `--out`. Exit codes:
-0 success, 1 config / input error, 2 modeling error (no rows produced).
+The established `run` arguments remain `--config --runtimes --opcounts --out`;
+`--manifest` is optional. All behavioral settings live in YAML. Exit codes are
+0 success, 1 config/input/comparability error, and 2 no successful fit.
+`compare-campaigns` requires complete manifests. Software revision may differ;
+workload, measurement boundary, hardware, and gas-schedule factors must match.
 
-Mapping of the §2.5 validation outcomes onto these exit codes:
-
-- A `gas_costs.overrides` key that is not a raw fork field → exit 1.
-- A `new_params` key that collides with a raw fork field, has an empty name,
-  or is declared but never referenced → exit 1.
-- A `model_params` RHS value that is neither a raw fork field nor a declared
-  `new_params` key → exit 1.
-- A `derived:` formula identifier that doesn't resolve in the universe
-  (raw fork fields ∪ `new_params` ∪ proposed-by-model_params ∪ earlier
-  derived keys) → exit 1.
-- A `derived:` key that shadows a raw fork field → **warning, not exit 1**.
-  The run proceeds; the warning is written to stderr at load time and
-  surfaces in the Warnings section of `new_gas_proposal.md`.
+- An unknown `gas_costs.overrides` key → exit 1.
+- An invalid `new_params`, model RHS, or derived identifier → exit 1.
+- A derived key shadowing a raw fork field is a warning; the run proceeds.
 
 ### Python API
 

@@ -8,14 +8,32 @@ from importlib import import_module
 def get_from_execution_specs(fork: str) -> dict[str, int]:
     """Return the fork's gas-cost fields as a flat dict.
 
+    Current execution-specs exposes forks below ``ethereum.forks``. Older
+    published packages used ``ethereum.<fork>``; retain that path so existing
+    Osaka analyses keep their source-selection behavior.
+
     Raises:
         ImportError: when the ``execution-specs`` extra is not installed or the
             fork's ``GasCosts`` class cannot be located.
     """
-    module = import_module(f"ethereum.{fork}.vm.gas")
+    module = None
+    paths = (
+        f"ethereum.forks.{fork}.vm.gas",
+        f"ethereum.{fork}.vm.gas",
+    )
+    for path in paths:
+        try:
+            module = import_module(path)
+            break
+        except ImportError:
+            continue
+    if module is None:
+        joined = " or ".join(paths)
+        raise ImportError(f"could not import {joined}")
+
     gas_costs = getattr(module, "GasCosts", None)
     if gas_costs is None:
-        raise ImportError(f"ethereum.{fork}.vm.gas has no GasCosts attribute")
+        raise ImportError(f"{module.__name__} has no GasCosts attribute")
     # GasCosts is expected to expose integer-valued attributes; collect the
     # public ones into a plain dict.
     out: dict[str, int] = {}
@@ -26,5 +44,5 @@ def get_from_execution_specs(fork: str) -> dict[str, int]:
         if isinstance(value, int) and not isinstance(value, bool):
             out[name] = value
     if not out:
-        raise ImportError(f"ethereum.{fork}.vm.gas.GasCosts exposes no integer fields")
+        raise ImportError(f"{module.__name__}.GasCosts exposes no integer fields")
     return out
