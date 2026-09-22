@@ -1,10 +1,158 @@
-"""Literal per-fork gas-cost tables used when the optional execution-specs extra is absent.
+"""Literal per-fork gas-cost tables used when execution-specs is unavailable.
 
-Values mirror the public integer attributes of each fork's ``GasCosts`` class in
-``ethereum/execution-specs``. Keep this table in sync with that upstream source.
+``_PRAGUE`` follows the public integer fields in
+``ethereum.forks.prague.vm.gas.GasCosts``. ``_OSAKA`` is retained unchanged
+for reproducibility of existing historical analyses.
 """
 
 from __future__ import annotations
+
+_PRAGUE: dict[str, int] = {
+    # Tiers
+    "BASE": 2,
+    "VERY_LOW": 3,
+    "LOW": 5,
+    "MID": 8,
+    "HIGH": 10,
+    # Access
+    "WARM_ACCESS": 100,
+    "COLD_ACCOUNT_ACCESS": 2600,
+    "COLD_STORAGE_ACCESS": 2100,
+    # Storage
+    "STORAGE_SET": 20000,
+    "COLD_STORAGE_WRITE": 5000,
+    # Call
+    "CALL_STIPEND": 2300,
+    "CALL_VALUE": 9000,
+    "NEW_ACCOUNT": 25000,
+    # Contract creation
+    "CODE_DEPOSIT_PER_BYTE": 200,
+    "CODE_INIT_PER_WORD": 2,
+    # Authorization
+    "AUTH_PER_EMPTY_ACCOUNT": 25000,
+    # Utility
+    "ZERO": 0,
+    "MEMORY_PER_WORD": 3,
+    "FAST_STEP": 5,
+    # Refunds
+    "REFUND_STORAGE_CLEAR": 4800,
+    "REFUND_AUTH_PER_EXISTING_ACCOUNT": 12500,
+    # Precompiles
+    "PRECOMPILE_ECRECOVER": 3000,
+    "PRECOMPILE_SHA256_BASE": 60,
+    "PRECOMPILE_SHA256_PER_WORD": 12,
+    "PRECOMPILE_RIPEMD160_BASE": 600,
+    "PRECOMPILE_RIPEMD160_PER_WORD": 120,
+    "PRECOMPILE_IDENTITY_BASE": 15,
+    "PRECOMPILE_IDENTITY_PER_WORD": 3,
+    # BLAKE2F charges only per round; the catalog needs an explicit base term.
+    "PRECOMPILE_BLAKE2F_BASE": 0,
+    "PRECOMPILE_BLAKE2F_PER_ROUND": 1,
+    "PRECOMPILE_POINT_EVALUATION": 50000,
+    "PRECOMPILE_BLS_G1ADD": 375,
+    "PRECOMPILE_BLS_G1MUL": 12000,
+    "PRECOMPILE_BLS_G1MAP": 5500,
+    "PRECOMPILE_BLS_G2ADD": 600,
+    "PRECOMPILE_BLS_G2MUL": 22500,
+    "PRECOMPILE_BLS_G2MAP": 23800,
+    "PRECOMPILE_ECADD": 150,
+    "PRECOMPILE_ECMUL": 6000,
+    "PRECOMPILE_ECPAIRING_BASE": 45000,
+    "PRECOMPILE_ECPAIRING_PER_POINT": 34000,
+    # Blobs
+    "PER_BLOB": 2**17,
+    "BLOB_TARGET_GAS_PER_BLOCK": 786432,
+    "BLOB_MIN_GASPRICE": 1,
+    "BLOB_BASE_FEE_UPDATE_FRACTION": 5007716,
+    # Transactions
+    "TX_BASE": 21000,
+    "TX_CREATE": 32000,
+    "TX_DATA_TOKEN_STANDARD": 4,
+    "TX_DATA_TOKEN_FLOOR": 10,
+    "TX_ACCESS_LIST_ADDRESS": 2400,
+    "TX_ACCESS_LIST_STORAGE_KEY": 1900,
+    # Block
+    "LIMIT_ADJUSTMENT_FACTOR": 1024,
+    "LIMIT_MINIMUM": 5000,
+    # Static opcodes
+    "OPCODE_ADD": 3,
+    "OPCODE_SUB": 3,
+    "OPCODE_MUL": 5,
+    "OPCODE_DIV": 5,
+    "OPCODE_SDIV": 5,
+    "OPCODE_MOD": 5,
+    "OPCODE_SMOD": 5,
+    "OPCODE_ADDMOD": 8,
+    "OPCODE_MULMOD": 8,
+    "OPCODE_SIGNEXTEND": 5,
+    "OPCODE_LT": 3,
+    "OPCODE_GT": 3,
+    "OPCODE_SLT": 3,
+    "OPCODE_SGT": 3,
+    "OPCODE_EQ": 3,
+    "OPCODE_ISZERO": 3,
+    "OPCODE_AND": 3,
+    "OPCODE_OR": 3,
+    "OPCODE_XOR": 3,
+    "OPCODE_NOT": 3,
+    "OPCODE_BYTE": 3,
+    "OPCODE_SHL": 3,
+    "OPCODE_SHR": 3,
+    "OPCODE_SAR": 3,
+    "OPCODE_JUMP": 8,
+    "OPCODE_JUMPI": 10,
+    "OPCODE_JUMPDEST": 1,
+    "OPCODE_CALLDATALOAD": 3,
+    "OPCODE_BLOCKHASH": 20,
+    "OPCODE_COINBASE": 2,
+    "OPCODE_POP": 2,
+    "OPCODE_MSIZE": 2,
+    "OPCODE_PC": 2,
+    "OPCODE_GAS": 2,
+    "OPCODE_ADDRESS": 2,
+    "OPCODE_ORIGIN": 2,
+    "OPCODE_CALLER": 2,
+    "OPCODE_CALLVALUE": 2,
+    "OPCODE_CALLDATASIZE": 2,
+    "OPCODE_CODESIZE": 2,
+    "OPCODE_GASPRICE": 2,
+    "OPCODE_TIMESTAMP": 2,
+    "OPCODE_NUMBER": 2,
+    "OPCODE_GASLIMIT": 2,
+    "OPCODE_PREVRANDAO": 2,
+    "OPCODE_RETURNDATASIZE": 2,
+    "OPCODE_CHAINID": 2,
+    "OPCODE_SELFBALANCE": 5,
+    "OPCODE_BASEFEE": 2,
+    "OPCODE_BLOBBASEFEE": 2,
+    "OPCODE_BLOBHASH": 3,
+    "OPCODE_PUSH": 3,
+    "OPCODE_PUSH0": 2,
+    "OPCODE_DUP": 3,
+    "OPCODE_SWAP": 3,
+    "OPCODE_TLOAD": 100,
+    "OPCODE_TSTORE": 100,
+    # Dynamic opcode components
+    "OPCODE_RETURNDATACOPY_BASE": 3,
+    "OPCODE_RETURNDATACOPY_PER_WORD": 3,
+    "OPCODE_CALLDATACOPY_BASE": 3,
+    "OPCODE_CODECOPY_BASE": 3,
+    "OPCODE_MCOPY_BASE": 3,
+    "OPCODE_MLOAD_BASE": 3,
+    "OPCODE_MSTORE_BASE": 3,
+    "OPCODE_MSTORE8_BASE": 3,
+    "OPCODE_COPY_PER_WORD": 3,
+    "OPCODE_CREATE_BASE": 32000,
+    "OPCODE_EXP_BASE": 10,
+    "OPCODE_EXP_PER_BYTE": 50,
+    "OPCODE_KECCAK256_BASE": 30,
+    "OPCODE_KECCAK256_PER_WORD": 6,
+    "OPCODE_LOG_BASE": 375,
+    "OPCODE_LOG_DATA_PER_BYTE": 8,
+    "OPCODE_LOG_TOPIC": 375,
+    "OPCODE_SELFDESTRUCT_BASE": 5000,
+    "OPCODE_SELFDESTRUCT_NEW_ACCOUNT": 25000,
+}
 
 _OSAKA: dict[str, int] = {
     # Tiers
@@ -159,8 +307,8 @@ _OSAKA: dict[str, int] = {
     # Placeholder so e2e tests can exercise an alt name alongside OPCODE_ADD.
     "OPCODE_ADD_ALT": 3,
 }
-
 _TABLES: dict[str, dict[str, int]] = {
+    "prague": _PRAGUE,
     "osaka": _OSAKA,
 }
 

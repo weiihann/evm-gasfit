@@ -613,14 +613,14 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_ecrecover": ModelSpec(
         test_name="test_ecrecover",
         target_operation="ECRECOVER",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000001",
         filter_by=["ecrecover"],
         model_params={"target_coef": "PRECOMPILE_ECRECOVER"},
     ),
     "precompile_sha256_fixed": ModelSpec(
         test_name="test_sha256_fixed_size",
         target_operation="SHA256",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000002",
         filter_by=["sha256"],
         fixture_params={"size_words": _bytes_to_words("size")},
         model_params={
@@ -631,7 +631,7 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_sha256_uncachable": ModelSpec(
         test_name="test_sha256_uncachable",
         target_operation="SHA256",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000002",
         filter_by=["sha256"],
         fixture_params={"size_words": _bytes_to_words("size")},
         model_params={
@@ -642,7 +642,7 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_ripemd160_fixed": ModelSpec(
         test_name="test_ripemd160_fixed_size",
         target_operation="RIPEMD160",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000003",
         filter_by=["ripemd160"],
         fixture_params={"size_words": _bytes_to_words("size")},
         model_params={
@@ -653,7 +653,7 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_ripemd160_uncachable": ModelSpec(
         test_name="test_ripemd160_uncachable",
         target_operation="RIPEMD160",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000003",
         filter_by=["ripemd160"],
         fixture_params={"size_words": _bytes_to_words("size")},
         model_params={
@@ -664,7 +664,7 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_identity_fixed": ModelSpec(
         test_name="test_identity_fixed_size",
         target_operation="IDENTITY",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000004",
         filter_by=["identity"],
         fixture_params={"size_words": _bytes_to_words("size")},
         model_params={
@@ -675,7 +675,7 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_identity_uncachable": ModelSpec(
         test_name="test_identity_uncachable",
         target_operation="IDENTITY",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000004",
         filter_by=["identity"],
         fixture_params={"size_words": _bytes_to_words("size")},
         model_params={
@@ -686,7 +686,7 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_blake2f": ModelSpec(
         test_name="test_blake2f_benchmark",
         target_operation="BLAKE2F",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000009",
         filter_by=["blake2f"],
         model_params={
             "target_coef": "PRECOMPILE_BLAKE2F_BASE",
@@ -696,7 +696,7 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_blake2f_uncachable": ModelSpec(
         test_name="test_blake2f_uncachable",
         target_operation="BLAKE2F",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000009",
         filter_by=["blake2f"],
         model_params={
             "target_coef": "PRECOMPILE_BLAKE2F_BASE",
@@ -706,35 +706,35 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_p256verify": ModelSpec(
         test_name="test_p256verify",
         target_operation="P256VERIFY",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000100",
         filter_by=["p256verify"],
         model_params={"target_coef": "PRECOMPILE_P256VERIFY"},
     ),
     "precompile_p256verify_uncachable": ModelSpec(
         test_name="test_p256verify_uncachable",
         target_operation="P256VERIFY",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000100",
         filter_by=["p256verify"],
         model_params={"target_coef": "PRECOMPILE_P256VERIFY"},
     ),
     "precompile_point_evaluation": ModelSpec(
         test_name="test_point_evaluation",
         target_operation="POINT_EVALUATION",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x000000000000000000000000000000000000000a",
         filter_by=["point_evaluation"],
         model_params={"target_coef": "PRECOMPILE_POINT_EVALUATION"},
     ),
     "precompile_point_evaluation_uncachable": ModelSpec(
         test_name="test_point_evaluation_uncachable",
         target_operation="POINT_EVALUATION",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x000000000000000000000000000000000000000a",
         filter_by=["point_evaluation"],
         model_params={"target_coef": "PRECOMPILE_POINT_EVALUATION"},
     ),
     "precompile_bn128_add": ModelSpec(
         test_name="test_alt_bn128",
         target_operation="ECADD",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000006",
         # The add-family covers four EEST variants (`bn128_add`,
         # `bn128_add_negative`, `bn128_add_infinities`, `bn128_double`); the
         # `!bn128_mul` negation excludes the mul-family which shares the
@@ -748,28 +748,28 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_bn128_mul": ModelSpec(
         test_name="test_alt_bn128",
         target_operation="ECMUL",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000007",
         filter_by=["bn128_mul_"],
         model_params={"target_coef": "PRECOMPILE_ECMUL"},
     ),
     "precompile_bn128_add_uncachable": ModelSpec(
         test_name="test_alt_bn128_uncachable",
         target_operation="ECADD",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000006",
         filter_by=["ec_add"],
         model_params={"target_coef": "PRECOMPILE_ECADD"},
     ),
     "precompile_bn128_mul_uncachable": ModelSpec(
         test_name="test_alt_bn128_uncachable",
         target_operation="ECMUL",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000007",
         filter_by=["ec_mul_"],
         model_params={"target_coef": "PRECOMPILE_ECMUL"},
     ),
     "precompile_bn128_pairing": ModelSpec(
         test_name="test_alt_bn128_benchmark",
         target_operation="ECPAIRING",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000008",
         filter_by=["num_pairs"],
         model_params={
             "target_coef": "PRECOMPILE_ECPAIRING_BASE",
@@ -779,7 +779,7 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_bn128_pairing_alt": ModelSpec(
         test_name="test_ec_pairing",
         target_operation="ECPAIRING",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000008",
         model_params={
             "target_coef": "PRECOMPILE_ECPAIRING_BASE",
             "num_pairs": "PRECOMPILE_ECPAIRING_PER_POINT",
@@ -791,35 +791,35 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_bls_g1add": ModelSpec(
         test_name="test_bls12_381",
         target_operation="BLS12_G1ADD",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x000000000000000000000000000000000000000b",
         filter_by=["bls12_g1add"],
         model_params={"target_coef": "PRECOMPILE_BLS_G1ADD"},
     ),
     "precompile_bls_g2add": ModelSpec(
         test_name="test_bls12_381",
         target_operation="BLS12_G2ADD",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x000000000000000000000000000000000000000d",
         filter_by=["bls12_g2add"],
         model_params={"target_coef": "PRECOMPILE_BLS_G2ADD"},
     ),
     "precompile_bls_fp_to_g1": ModelSpec(
         test_name="test_bls12_381",
         target_operation="BLS12_MAP_FP_TO_G1",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x000000000000000000000000000000000000000f",
         filter_by=["bls12_fp_to_g1"],
         model_params={"target_coef": "PRECOMPILE_BLS_G1MAP"},
     ),
     "precompile_bls_fp_to_g2": ModelSpec(
         test_name="test_bls12_381",
         target_operation="BLS12_MAP_FP_TO_G2",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000010",
         filter_by=["bls12_fp_to_g2"],
         model_params={"target_coef": "PRECOMPILE_BLS_G2MAP"},
     ),
     "precompile_bls_g1msm": ModelSpec(
         test_name="test_bls12_g1_msm",
         target_operation="BLS12_G1MSM",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x000000000000000000000000000000000000000c",
         filter_by=["bls12_g1msm"],
         model_by=["k"],
         model_params={"target_coef": "PRECOMPILE_BLS_G1MUL"},
@@ -827,7 +827,7 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_bls_g2msm": ModelSpec(
         test_name="test_bls12_g2_msm",
         target_operation="BLS12_G2MSM",
-        target_operation_count_source="STATICCALL",
+        target_operation_count_source="PRECOMPILE_0x000000000000000000000000000000000000000e",
         filter_by=["bls12_g2msm"],
         model_by=["k"],
         model_params={"target_coef": "PRECOMPILE_BLS_G2MUL"},

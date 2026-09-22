@@ -24,6 +24,36 @@ _log = logging.getLogger("evm_gasfit.estimate")
 
 
 @dataclass
+class PlannedFit:
+    """One planned ``(spec, model_by-combo, client)`` fit, fitted or not.
+
+    The qualification layer emits a status for *every* planned fit; this
+    record is how a fit that never ran (empty spec slice, rank-deficient
+    design, solver failure) stays visible with its skip reason instead of
+    disappearing from the outputs.
+    """
+
+    source_label: str
+    test_name: str
+    target_opcode: str | None
+    group_values: dict[str, str]
+    client: str
+    fit: NNLSResults | None = None
+    skip_reason: str | None = None
+    dropped_features: tuple[str, ...] = ()
+
+    @property
+    def key(self) -> tuple:
+        return (
+            self.source_label,
+            self.test_name,
+            self.target_opcode or "",
+            *[self.group_values[c] for c in sorted(self.group_values)],
+            self.client,
+        )
+
+
+@dataclass
 class EstimateOutput:
     """Bundle of ``results_df`` and the parallel ``fits`` dict.
 
@@ -32,11 +62,55 @@ class EstimateOutput:
     so the reports layer can look up the underlying :class:`NNLSResults` for
     each row in ``results_df``. ``source_label`` leads the key so two specs
     sharing test_name + target + model_by (differing only in ``filter_by``)
-    don't overwrite each other's fit.
+    don't overwrite each other's fit. ``planned`` carries one record per
+    planned fit — including the ones that never produced a row — for the
+    qualification layer.
     """
 
     results_df: pd.DataFrame
     fits: dict[tuple, NNLSResults] = field(default_factory=dict)
+    planned: list[PlannedFit] = field(default_factory=list)
+
+
+def _empty_results_df(config: Config) -> pd.DataFrame:
+    """Return the successful-fit schema when a campaign has no eligible rows."""
+    model_by_cols = sorted(
+        {c for spec in config.resolved_models for c in spec.model_by}
+    )
+    feature_names: list[str] = []
+    for spec in config.resolved_models:
+        for name in [*spec.model_params, *spec.setup_params]:
+            if name != "target_coef" and name not in feature_names:
+                feature_names.append(name)
+
+    columns = [
+        "test_name",
+        "client_name",
+        "target_opcode",
+        "source_label",
+        *model_by_cols,
+        "nobs",
+        "intercept_runtime_ms",
+        "intercept_pvalue",
+        "rsquared",
+        "rsquared_adj",
+        "target_coef_runtime_ms",
+        "target_coef_pvalue",
+        "target_coef_conf_int_low",
+        "target_coef_conf_int_high",
+        "condition_number",
+        "n_sessions",
+    ]
+    for name in feature_names:
+        columns.extend(
+            [
+                f"{name}_runtime_ms",
+                f"{name}_pvalue",
+                f"{name}_conf_int_low",
+                f"{name}_conf_int_high",
+            ]
+        )
+    return pd.DataFrame(columns=columns)
 
 
 def _apply_filters(df: pd.DataFrame, filter_by: list[str]) -> pd.DataFrame:
@@ -114,59 +188,67 @@ def _resolve_target_opcode(df: pd.DataFrame, spec: ModelSpec) -> pd.DataFrame:
     return df
 
 
-def _split_baseline_pair(df: pd.DataFrame, spec: ModelSpec) -> pd.DataFrame:
-    """Replace each ``overhead_baseline_False`` row's runtime *and* every
-    per-opcode count with its delta against the matching
-    ``overhead_baseline_True`` fixture's mean, dropping the ``True`` rows.
+def _split_baseline_pair(
+    df: pd.DataFrame,
+    spec: ModelSpec,
+    session_column: str | None,
+) -> pd.DataFrame:
+    """Replace each ``overhead_baseline_False`` row with its delta against the
+    matching ``overhead_baseline_True`` control, dropping the ``True`` rows.
 
-    A ``True`` fixture runs the same harness loop without the target opcode,
-    so ``False - True`` isolates the target's own cost from everything the
-    two variants share. Diffing runtime alone would only be correct for glue
-    opcodes whose count is identical between variants (e.g. keccak on a cold
-    account probe) — anything that scales with the target's own opcount
-    (e.g. the GAS/PUSH/POP calling convention around a CALL) is zero on the
-    ``True`` side and non-zero on ``False``, so it does *not* cancel and must
-    stay visible for the per-opcode glue detector (:mod:`evm_gasfit.glue.detect`)
-    to pick up downstream. Diffing every opcode-count column, not just
-    runtime, makes both cases fall out of the same subtraction: a shared,
-    non-scaling contaminant lands at a constant delta (correlation with
-    opcount fails, so it's never flagged as glue and never double-counted);
-    a scaling one lands at the same delta it would show in a raw fit, and
-    gets detected and priced exactly as it would without pairing.
+    The transform differences runtime, ``opcount``, and every per-opcode
+    count. A control may execute fixed production-tail work, so leaving
+    ``opcount`` untouched would make the post-pair target-count invariant
+    compare variable work with the false row's total count.
 
-    Benchmark suites commonly repeat the same fixture across several trials,
-    so the ``True`` side is aggregated to one mean row per fixture identity
-    before the merge — each ``False`` trial keeps its own independent noise
-    and is compared against the lower-variance baseline estimate, rather
-    than an arbitrary single ``True`` trial. Must run before
-    :func:`_enforce_opcount_invariant`: every ``True`` row has ``opcount ==
-    0``, which that check rejects.
+    ``overhead_baseline_match_params`` selects the control's shape key. The
+    legacy ``None`` setting matches every populated raw parameter except the
+    baseline flag. An explicit empty list matches only client and session;
+    a nonempty list names the raw parameters that must match. The selected
+    ``True`` rows are averaged per key before merging, so repeated controls
+    lower baseline noise without fanning out false trials.
     """
     col = spec.overhead_baseline_param
     if col is None:
         return df
-    false_df = df[df[col] == "False"]
-    true_df = df[df[col] == "True"]
-    # Only columns with at least one real value in this slice discriminate
-    # fixtures; other tests' param columns are all-NaN here and would ride
-    # along in the join key for no reason (harmless, since uniformly NaN on
-    # both sides, but pointless to carry).
-    pair_cols = [
-        c
-        for c in df.columns
-        if c.startswith("param_") and c != col and df[c].notna().any()
-    ]
+    baseline_flags = df[col].astype("string").str.strip().str.casefold()
+    false_df = df[baseline_flags == "false"]
+    true_df = df[baseline_flags == "true"]
+    match_params = spec.overhead_baseline_match_params
+    if match_params is None:
+        # Only columns with at least one real value in this slice discriminate
+        # fixtures; all-NaN columns originate in other benchmark families.
+        pair_cols = [
+            c
+            for c in df.columns
+            if c.startswith("param_") and c != col and df[c].notna().any()
+        ]
+    else:
+        missing = [
+            c for c in match_params if c not in df.columns or not df[c].notna().any()
+        ]
+        if missing:
+            logical_names = [c.removeprefix("param_") for c in missing]
+            raise ConfigError(
+                f"spec test_name={spec.test_name!r}: "
+                "overhead_baseline_match_params references missing or empty "
+                f"fixture parameter(s) {logical_names!r}"
+            )
+        pair_cols = list(match_params)
     pair_cols.append("client_name")
-    # Diff every numeric column except the pairing key and ``opcount``, which
-    # must stay the (unpaired) target opcount — it's the regression's x-axis
-    # and the correlation reference in glue detection, not a contaminant.
-    diff_cols = [
-        c
-        for c in df.columns
-        if c not in pair_cols
-        and c != "opcount"
-        and pd.api.types.is_numeric_dtype(df[c])
-    ]
+    if session_column is not None and session_column in df.columns:
+        pair_cols.append(session_column)
+    # Read attrs before the merge below: DataFrame.attrs is not guaranteed to
+    # survive it. ``opcount`` is intentionally explicit because it is not an
+    # opcode mnemonic but must track the target-count delta.
+    opcode_columns = set(df.attrs.get("opcode_columns", []))
+    diff_cols = list(
+        dict.fromkeys(
+            c
+            for c in ["test_runtime_ms", "opcount", *(sorted(opcode_columns))]
+            if c in df.columns
+        )
+    )
     true_baseline = (
         true_df.groupby(pair_cols, dropna=False)[diff_cols]
         .mean()
@@ -195,10 +277,11 @@ def _split_baseline_pair(df: pd.DataFrame, spec: ModelSpec) -> pd.DataFrame:
 def _enforce_opcount_invariant(df: pd.DataFrame, spec: ModelSpec) -> None:
     """Check ``opcount == row[count_source]`` per the input invariant.
 
-    For ordinary opcode targets the count source is the resolved target opcode
-    itself. For precompile specs (``target_operation_count_source`` set), the
-    target is a synthetic display name with no opcount column, so the
-    invariant is checked against the override column (typically ``STATICCALL``).
+    For ordinary opcode targets the count source is the resolved target opcode.
+    For precompile specs the target is a display name with no opcode column, so
+    the invariant uses ``PRECOMPILE_0x<40 lowercase hexadecimal address>``:
+    the destination-semantic invocation key. It is never a bare ``STATICCALL``
+    count, which includes wrapper calls and overstates the target work.
     """
     count_source_override = spec.target_operation_count_source
     for _, row in df.iterrows():
@@ -228,11 +311,15 @@ def _enforce_opcount_invariant(df: pd.DataFrame, spec: ModelSpec) -> None:
 def _build_design(
     df: pd.DataFrame,
     spec: ModelSpec,
-) -> tuple[pd.DataFrame, list[str]]:
+    session_column: str | None = None,
+) -> tuple[pd.DataFrame, list[str], list[str], list[str], pd.Series | None]:
     """Build the design matrix for one (group, client) slice.
 
-    Returns the (renamed) frame and the list of non-``target_coef`` feature
-    names that survived the one-value-extras filter.
+    Returns the (renamed) frame, surviving interaction and setup features,
+    configured features dropped for having one observed value, and per-row
+    session labels (``None`` when the campaign has no session column).
+    Sessions ride along on the design frame purely as grouping metadata —
+    they are never a regressor.
     """
     design = pd.DataFrame(
         {
@@ -241,23 +328,30 @@ def _build_design(
         },
         index=df.index,
     )
+    sessions: pd.Series | None = None
+    if session_column is not None and session_column in df.columns:
+        sessions = df[session_column].astype(str).reset_index(drop=True)
+
+    def _resolve_source(coef_name: str) -> str:
+        # A model_params/setup_params key can reference either a derived
+        # column produced by ``_materialize_derived`` (its natural name) or a
+        # raw parsed-param column (exposed as ``param_<name>`` by
+        # ``build_fixtures_df``).
+        if coef_name in df.columns:
+            return coef_name
+        if f"param_{coef_name}" in df.columns:
+            return f"param_{coef_name}"
+        raise ModelingError(
+            f"spec test_name={spec.test_name!r}: coefficient {coef_name!r} "
+            f"has no matching fixture-param column"
+        )
+
     extras: list[str] = []
+    dropped_features: list[str] = []
     for coef_name in spec.model_params:
         if coef_name == "target_coef":
             continue
-        # A model_params key can reference either a derived column produced by
-        # ``_materialize_derived`` (its natural name) or a raw parsed-param
-        # column (exposed as ``param_<name>`` by ``build_fixtures_df``).
-        if coef_name in df.columns:
-            source_col = coef_name
-        elif f"param_{coef_name}" in df.columns:
-            source_col = f"param_{coef_name}"
-        else:
-            raise ModelingError(
-                f"spec test_name={spec.test_name!r}: model_params coefficient "
-                f"{coef_name!r} has no matching fixture-param column"
-            )
-        param_vals = df[source_col].astype(float).to_numpy()
+        param_vals = df[_resolve_source(coef_name)].astype(float).to_numpy()
         if len(set(param_vals.tolist())) <= 1:
             _log.warning(
                 "spec test_name=%r: dropping extra feature %r — single unique value "
@@ -265,10 +359,31 @@ def _build_design(
                 spec.test_name,
                 coef_name,
             )
+            dropped_features.append(coef_name)
             continue
         design[coef_name] = design["opcount"].to_numpy() * param_vals
         extras.append(coef_name)
-    return design, extras
+
+    # Setup features: n-independent terms whose value is the fixture-param
+    # itself (e.g. an input length in words), NOT multiplied by opcount.
+    # A setup cost that grows with input length is a real per-workload cost;
+    # folding it into the intercept only works when the length never varies,
+    # and these features exist precisely for sweeps where it does.
+    setup_features: list[str] = []
+    for coef_name in spec.setup_params:
+        param_vals = df[_resolve_source(coef_name)].astype(float).to_numpy()
+        if len(set(param_vals.tolist())) <= 1:
+            _log.warning(
+                "spec test_name=%r: dropping setup feature %r — single unique "
+                "value across the filtered fixtures",
+                spec.test_name,
+                coef_name,
+            )
+            dropped_features.append(coef_name)
+            continue
+        design[coef_name] = param_vals
+        setup_features.append(coef_name)
+    return design, extras, setup_features, dropped_features, sessions
 
 
 def _fit_or_skip(
@@ -278,8 +393,14 @@ def _fit_or_skip(
     spec: ModelSpec,
     client: str,
     group_label: str,
-) -> NNLSResults | None:
-    """Run NNLS or log + skip per the §4.2 failure modes."""
+    sessions: pd.Series | None = None,
+) -> tuple[NNLSResults | None, str | None]:
+    """Run NNLS or log + skip per the §4.2 failure modes.
+
+    Returns ``(fit, None)`` on success and ``(None, reason)`` on skip. The
+    reason feeds the qualification ledger so a planned model that produced
+    no fit keeps an explicit ``failed`` status instead of vanishing.
+    """
     n_features_with_const = len(features) + 1
     if len(design) < n_features_with_const + 1:
         _log.warning(
@@ -290,7 +411,7 @@ def _fit_or_skip(
             len(design),
             n_features_with_const + 1,
         )
-        return None
+        return None, "too few observations for the design (nobs < n_features+1)"
     opcount = design["opcount"].to_numpy()
     if len(set(opcount.tolist())) <= 1 or np.all(opcount == 0):
         _log.warning(
@@ -299,7 +420,7 @@ def _fit_or_skip(
             group_label,
             client,
         )
-        return None
+        return None, "opcount is constant or zero across the filtered rows"
     feature_matrix = design[features].to_numpy(dtype=float)
     design_with_const = np.column_stack([np.ones(len(feature_matrix)), feature_matrix])
     if np.linalg.matrix_rank(design_with_const) < design_with_const.shape[1]:
@@ -309,14 +430,20 @@ def _fit_or_skip(
             group_label,
             client,
         )
-        return None
+        # Additional repetitions cannot separate proportional regressors —
+        # this is the collapsed-design case the plan calls out explicitly.
+        return None, "design matrix is rank-deficient (proportional regressors)"
     try:
-        return fit_nnls(
-            design,
-            features=features,
-            target="test_runtime_ms",
-            n_bootstrap=config.modeling.bootstrap_iterations,
-            random_seed=config.modeling.random_seed,
+        return (
+            fit_nnls(
+                design,
+                features=features,
+                target="test_runtime_ms",
+                n_bootstrap=config.modeling.bootstrap_iterations,
+                random_seed=config.modeling.random_seed,
+                groups=sessions,
+            ),
+            None,
         )
     except Exception as exc:  # noqa: BLE001 -- broad on purpose: any numerical failure means this fit attempt is unfit, not a crash
         _log.warning(
@@ -326,7 +453,7 @@ def _fit_or_skip(
             client,
             exc,
         )
-        return None
+        return None, f"NNLS solver raised {exc}"
 
 
 def _build_result_row(
@@ -337,8 +464,10 @@ def _build_result_row(
     group_values: dict[str, str],
     fit: NNLSResults,
     extras: list[str],
+    setup_features: list[str],
+    confidence_level: float,
 ) -> dict[str, object]:
-    ci = fit.conf_int()
+    ci = fit.conf_int(alpha=1.0 - confidence_level)
     row: dict[str, object] = {
         "test_name": spec.test_name,
         "client_name": client,
@@ -361,9 +490,17 @@ def _build_result_row(
             "target_coef_pvalue": float(fit.pvalues["opcount"]),
             "target_coef_conf_int_low": float(ci.loc["opcount", 0]),
             "target_coef_conf_int_high": float(ci.loc["opcount", 1]),
+            # Conditioning + session evidence, computed from the same design
+            # the fit saw. Holdout errors and residual curvature live on the
+            # qualification table; these two columns are cheap enough to sit
+            # on every row of results.csv.
+            "condition_number": float(fit.condition_number),
+            "n_sessions": (
+                len(np.unique(fit.groups)) if fit.groups is not None else np.nan
+            ),
         }
     )
-    for extra in extras:
+    for extra in extras + setup_features:
         row[f"{extra}_runtime_ms"] = float(fit.params[extra])
         row[f"{extra}_pvalue"] = float(fit.pvalues[extra])
         row[f"{extra}_conf_int_low"] = float(ci.loc[extra, 0])
@@ -385,13 +522,25 @@ def estimate_models(config: Config, fixtures_df: pd.DataFrame) -> EstimateOutput
         (one row per successful fit) and a parallel dict of fit objects.
 
     Raises:
-        ConfigError: If the input opcount invariant is violated for any
-            filtered fixture.
-        ModelingError: If every fit across every spec is skipped.
+        ModelingError: If every fit is skipped for a legacy, non-campaign
+            input.
     """
     rows: list[dict[str, object]] = []
     fits: dict[tuple, NNLSResults] = {}
+    planned: list[PlannedFit] = []
     unmatched: list[ModelSpec] = []
+    session_column = config.campaign.session_column
+    if session_column not in fixtures_df.columns:
+        # Legacy three-column CSVs carry no session metadata; pairing and
+        # inference fall back to their ordinary non-campaign forms.
+        session_column = None
+
+    campaign_columns = (
+        config.campaign.phase_column,
+        config.campaign.status_column,
+        config.campaign.correctness_column,
+    )
+    campaign_data = all(column in fixtures_df.columns for column in campaign_columns)
 
     for spec in config.resolved_models:
         slice_df = fixtures_df[fixtures_df["test_name"] == spec.test_name]
@@ -403,10 +552,21 @@ def estimate_models(config: Config, fixtures_df: pd.DataFrame) -> EstimateOutput
                 spec.filter_by,
             )
             unmatched.append(spec)
+            for client in config.clients:
+                planned.append(
+                    PlannedFit(
+                        source_label=spec.source_label,
+                        test_name=spec.test_name,
+                        target_opcode=None,
+                        group_values={},
+                        client=client,
+                        skip_reason="no matching fixtures after filter_by",
+                    )
+                )
             continue
 
         slice_df = _resolve_target_opcode(slice_df, spec)
-        slice_df = _split_baseline_pair(slice_df, spec)
+        slice_df = _split_baseline_pair(slice_df, spec, session_column)
         _enforce_opcount_invariant(slice_df, spec)
         slice_df = _materialize_derived(slice_df, spec)
 
@@ -447,10 +607,43 @@ def estimate_models(config: Config, fixtures_df: pd.DataFrame) -> EstimateOutput
                 )
             target_opcode = next(iter(target_opcodes))
 
-            for client, client_df in group_df.groupby("client_name", sort=True):
-                design, extras = _build_design(client_df, spec)
-                features = ["opcount"] + extras
-                fit = _fit_or_skip(design, features, config, spec, client, group_label)
+            for client in config.clients:
+                client_df = group_df[group_df["client_name"] == client]
+                if client_df.empty:
+                    planned.append(
+                        PlannedFit(
+                            source_label=spec.source_label,
+                            test_name=spec.test_name,
+                            target_opcode=target_opcode,
+                            group_values=group_values,
+                            client=client,
+                            skip_reason="no eligible fixtures for configured client",
+                        )
+                    )
+                    continue
+                (
+                    design,
+                    extras,
+                    setup_features,
+                    dropped_features,
+                    sessions,
+                ) = _build_design(client_df, spec, session_column)
+                features = ["opcount"] + extras + setup_features
+                fit, skip_reason = _fit_or_skip(
+                    design, features, config, spec, client, group_label, sessions
+                )
+                planned.append(
+                    PlannedFit(
+                        source_label=spec.source_label,
+                        test_name=spec.test_name,
+                        target_opcode=target_opcode,
+                        group_values=group_values,
+                        client=client,
+                        fit=fit,
+                        skip_reason=skip_reason,
+                        dropped_features=tuple(dropped_features),
+                    )
+                )
                 if fit is None:
                     continue
                 row = _build_result_row(
@@ -460,6 +653,8 @@ def estimate_models(config: Config, fixtures_df: pd.DataFrame) -> EstimateOutput
                     group_values=group_values,
                     fit=fit,
                     extras=extras,
+                    setup_features=setup_features,
+                    confidence_level=config.qualification.confidence_level,
                 )
                 rows.append(row)
                 fit_key = (
@@ -485,6 +680,12 @@ def estimate_models(config: Config, fixtures_df: pd.DataFrame) -> EstimateOutput
         )
 
     if not rows:
+        if campaign_data:
+            return EstimateOutput(
+                results_df=_empty_results_df(config),
+                fits=fits,
+                planned=planned,
+            )
         raise ModelingError(
             "every model spec was skipped — no rows produced for results.csv"
         )
@@ -499,4 +700,4 @@ def estimate_models(config: Config, fixtures_df: pd.DataFrame) -> EstimateOutput
         drop=True
     )
 
-    return EstimateOutput(results_df=results_df, fits=fits)
+    return EstimateOutput(results_df=results_df, fits=fits, planned=planned)

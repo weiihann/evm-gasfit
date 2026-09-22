@@ -17,7 +17,12 @@ def load_runtimes(path: Path) -> pd.DataFrame:
     Args:
         path: Path to a CSV file containing at minimum the columns
             ``client_name``, ``fixture_name``, and ``test_runtime_ms``.
-            Extra columns pass through unchanged.
+            Extra columns pass through unchanged. Campaign runs add the
+            metadata columns ``session_id``, ``sample_id``, ``phase``,
+            ``status``, and ``repetition``; any further numeric metadata
+            (gas quantities, sequence numbers) also passes through and is
+            never consumed as a regressor or differenced by baseline
+            pairing.
 
     Returns:
         The parsed DataFrame. Duplicate ``(client_name, fixture_name)`` rows

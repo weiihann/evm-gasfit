@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import ast
 import logging
+import math
+import re
 from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, Literal
@@ -78,7 +80,165 @@ class ModelingSection(BaseModel):
     random_seed: int = 42
 
 
+class QualificationSection(BaseModel):
+    """Frozen qualification policy evaluated against every planned model.
+
+    Always-on gates (condition number, residual curvature) are checked on
+    every run; the optional gates arm only when configured. The policy is
+    echoed verbatim into ``analysis_status.json`` so a campaign archive
+    records the criteria that were in force.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    confidence_level: float = 0.95
+    max_condition_number: float = 1e8
+    max_residual_curvature_r2: float = 0.1
+    # Optional gates — ``None`` leaves the gate unarmed.
+    max_relative_uncertainty: float | None = None
+    max_holdout_error: float | None = None
+    min_sessions: int | None = None
+    # Treat the poor-fit thresholds (``modeling.poor_fit_*``) as qualification
+    # gates in addition to their existing selector role.
+    enforce_fit_quality: bool = False
+    # When true, an unqualified model's gas value is never emitted as a
+    # recommended price: ``new_gas_decimal`` / ``new_gas_rounded`` are left
+    # empty while ``runtime_ms`` stays as a research observation.
+    block_unqualified: bool = True
+
+    @model_validator(mode="after")
+    def _check(self) -> QualificationSection:
+        if not 0.0 < self.confidence_level < 1.0:
+            raise ConfigError(
+                "qualification.confidence_level must be in (0, 1), got "
+                f"{self.confidence_level}"
+            )
+        for name in (
+            "max_condition_number",
+            "max_relative_uncertainty",
+            "max_holdout_error",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                raise ConfigError(
+                    f"qualification.{name} must be finite and positive when set, "
+                    f"got {value}"
+                )
+        if self.max_condition_number <= 1.0:
+            raise ConfigError(
+                "qualification.max_condition_number must exceed 1, got "
+                f"{self.max_condition_number}"
+            )
+        if (
+            not math.isfinite(self.max_residual_curvature_r2)
+            or not 0.0 <= self.max_residual_curvature_r2 <= 1.0
+        ):
+            raise ConfigError(
+                "qualification.max_residual_curvature_r2 must be finite and in "
+                f"[0, 1], got {self.max_residual_curvature_r2}"
+            )
+        if self.min_sessions is not None and self.min_sessions < 1:
+            raise ConfigError(
+                "qualification.min_sessions must be >= 1 when set, got "
+                f"{self.min_sessions}"
+            )
+        return self
+
+
+class CampaignSection(BaseModel):
+    """Campaign metadata required to calibrate against exported samples.
+
+    Legacy CSVs without phase and status metadata are unfiltered. Once either
+    campaign field is present, only executed qualification or performance
+    samples with explicit passing correctness evidence can reach a fit. Rows
+    excluded by this policy are recorded in ``eligibility.csv``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_column: str = "session_id"
+    phase_column: str = "phase"
+    status_column: str = "status"
+    sample_column: str = "sample_id"
+    correctness_column: str = "correctness_passed"
+    eligible_phases: list[str] = Field(
+        default_factory=lambda: ["qualification", "performance"]
+    )
+    eligible_statuses: list[str] = Field(default_factory=lambda: ["executed"])
+    require_correctness_passed: bool = True
+
+    @model_validator(mode="after")
+    def _check_eligible_values(self) -> CampaignSection:
+        if not self.eligible_phases:
+            raise ConfigError("campaign.eligible_phases must not be empty")
+        unsupported_phases = set(self.eligible_phases) - {
+            "qualification",
+            "performance",
+        }
+        if unsupported_phases:
+            phases = ", ".join(repr(phase) for phase in sorted(unsupported_phases))
+            raise ConfigError(
+                "campaign.eligible_phases contains unsupported calibration phase(s): "
+                f"{phases}"
+            )
+        if not self.eligible_statuses:
+            raise ConfigError("campaign.eligible_statuses must not be empty")
+        unsupported_statuses = set(self.eligible_statuses) - {"executed"}
+        if unsupported_statuses:
+            statuses = ", ".join(
+                repr(status) for status in sorted(unsupported_statuses)
+            )
+            raise ConfigError(
+                "campaign.eligible_statuses contains unsupported calibration "
+                f"status(es): {statuses}"
+            )
+        if not self.require_correctness_passed:
+            raise ConfigError(
+                "campaign.require_correctness_passed must be true for calibration"
+            )
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_lists(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        for key in ("eligible_phases", "eligible_statuses"):
+            if data.get(key) is not None:
+                data[key] = _normalize_str_list(data[key], key)
+        return data
+
+
+class PricingScenario(BaseModel):
+    """One explicit anchor+margin pricing scenario (research output only)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    anchor_rate: float
+    margin_pct: float = 0.0
+
+    @model_validator(mode="after")
+    def _check(self) -> PricingScenario:
+        if not self.name:
+            raise ConfigError("pricing scenario name must be a non-empty string")
+        if not math.isfinite(self.anchor_rate) or self.anchor_rate <= 0:
+            raise ConfigError(
+                f"pricing scenario {self.name!r}: anchor_rate must be finite and "
+                f"positive, got {self.anchor_rate}"
+            )
+        if not math.isfinite(self.margin_pct) or self.margin_pct < 0:
+            raise ConfigError(
+                f"pricing scenario {self.name!r}: margin_pct must be finite and "
+                f">= 0, got {self.margin_pct}"
+            )
+        return self
+
+
 class OutputSection(BaseModel):
+    """Output controls."""
+
     model_config = ConfigDict(extra="forbid")
 
     plots: bool = True
@@ -127,9 +287,15 @@ class ModelSpec(BaseModel):
     target_operation_param: str | None = None
     target_operation_count_source: str | None = None
     overhead_baseline_param: str | None = None
+    overhead_baseline_match_params: list[str] | None = None
     filter_by: list[str] = Field(default_factory=list)
     model_by: list[str] = Field(default_factory=list)
     model_params: dict[str, str] = Field(default_factory=dict)
+    # Coefficient → gas-param map where the feature is the fixture-param's
+    # own value, NOT multiplied by ``opcount`` — for setup costs that scale
+    # with an input length rather than with the target-operation count
+    # Keys live in the same namespace as ``model_params`` keys.
+    setup_params: dict[str, str] = Field(default_factory=dict)
     fixture_params: dict[str, FixtureParamSpec] = Field(default_factory=dict)
     # Set by ``Config``'s top-level validator so diagnostic messages can name
     # the source of a spec (``presets[...]`` vs. ``models.custom[i]``).
@@ -145,6 +311,14 @@ class ModelSpec(BaseModel):
             data["filter_by"] = _normalize_str_list(data["filter_by"], "filter_by")
         if "model_by" in data:
             data["model_by"] = _normalize_str_list(data["model_by"], "model_by")
+        if (
+            "overhead_baseline_match_params" in data
+            and data["overhead_baseline_match_params"] is not None
+        ):
+            data["overhead_baseline_match_params"] = _normalize_str_list(
+                data["overhead_baseline_match_params"],
+                "overhead_baseline_match_params",
+            )
         return data
 
     @model_validator(mode="after")
@@ -163,7 +337,34 @@ class ModelSpec(BaseModel):
                 "target_operation_count_source is only valid alongside "
                 "target_operation (literal precompile display name)"
             )
+        if has_count_source and not re.fullmatch(
+            r"PRECOMPILE_0x[0-9a-f]{40}",
+            self.target_operation_count_source or "",
+        ):
+            raise ConfigError(
+                "target_operation_count_source must be "
+                "PRECOMPILE_0x<40 lowercase hexadecimal address>"
+            )
         # model_params must be non-empty and carry a target_coef key.
+        match_params = self.overhead_baseline_match_params
+        if match_params is not None:
+            if self.overhead_baseline_param is None:
+                raise ConfigError(
+                    "overhead_baseline_match_params requires overhead_baseline_param"
+                )
+            if self.overhead_baseline_param in match_params:
+                raise ConfigError(
+                    "overhead_baseline_match_params cannot include "
+                    "overhead_baseline_param"
+                )
+            duplicates = sorted(
+                name for name in set(match_params) if match_params.count(name) > 1
+            )
+            if duplicates:
+                raise ConfigError(
+                    "overhead_baseline_match_params contains duplicate name(s) "
+                    f"{duplicates!r}"
+                )
         if not self.model_params:
             raise ValueError("model_params must be non-empty")
         if "target_coef" not in self.model_params:
@@ -175,6 +376,19 @@ class ModelSpec(BaseModel):
             raise ConfigError(
                 f"derived param name {self.target_operation_param!r} collides "
                 f"with target_operation_param on spec test_name={self.test_name!r}"
+            )
+        # setup_params keys share the model_params coefficient namespace and
+        # must not collide with it or use the reserved target coefficient.
+        overlap = set(self.setup_params) & set(self.model_params)
+        if overlap:
+            raise ConfigError(
+                f"spec test_name={self.test_name!r}: setup_params key(s) "
+                f"{sorted(overlap)!r} collide with model_params keys"
+            )
+        if "target_coef" in self.setup_params:
+            raise ConfigError(
+                f"spec test_name={self.test_name!r}: setup_params cannot use the "
+                f"reserved 'target_coef' key"
             )
         return self
 
@@ -207,7 +421,11 @@ class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     version: Literal[1]
-    anchor_rate: float
+    # Pricing anchor (gas/second). ``None`` marks a comparison-only run: no
+    # ``new_gas_*`` values are produced and the mandatory compute-vs-current
+    # comparison carries the analysis. There is deliberately no default — an
+    # anchor is an experiment input, not something the tool invents.
+    anchor_rate: float | None = None
     clients: list[str]
     gas_costs: GasCostsSection
     glue_adjustment: GlueAdjustmentSection = Field(
@@ -215,6 +433,9 @@ class Config(BaseModel):
     )
     modeling: ModelingSection = Field(default_factory=ModelingSection)
     output: OutputSection = Field(default_factory=OutputSection)
+    qualification: QualificationSection = Field(default_factory=QualificationSection)
+    campaign: CampaignSection = Field(default_factory=CampaignSection)
+    pricing_scenarios: list[PricingScenario] = Field(default_factory=list)
     # ``derived`` values are either ``str`` (alias form) or ``{formula: str}``.
     derived: dict[str, Any] = Field(default_factory=dict)
     # Names introduced by the user/preset that are not raw fork fields. ``None``
@@ -238,6 +459,13 @@ class Config(BaseModel):
         # 0) Validate clients: non-empty list of non-empty unique strings.
         if not self.clients:
             raise ConfigError("clients must be a non-empty list")
+        if self.anchor_rate is not None and (
+            not math.isfinite(self.anchor_rate) or self.anchor_rate <= 0
+        ):
+            raise ConfigError(
+                f"anchor_rate must be finite and positive when set, got "
+                f"{self.anchor_rate}"
+            )
         seen_clients: set[str] = set()
         for name in self.clients:
             if not isinstance(name, str) or not name:
@@ -311,6 +539,10 @@ class Config(BaseModel):
                     k: v.model_copy(update={"source": f"param_{v.source}"})
                     for k, v in spec.fixture_params.items()
                 }
+            if spec.overhead_baseline_match_params is not None:
+                updates["overhead_baseline_match_params"] = [
+                    f"param_{name}" for name in spec.overhead_baseline_match_params
+                ]
             prefixed.append(spec.model_copy(update=updates) if updates else spec)
         self.resolved_models = prefixed
 
@@ -343,9 +575,12 @@ class Config(BaseModel):
                 )
         declared_new_params: set[str] = set(self.new_params)
 
-        # 6) Build the universe.
+        # 6) Build the universe (model_params and setup_params both propose
+        # gas-param names).
         proposed_by_model_params: set[str] = {
-            v for spec in resolved for v in spec.model_params.values()
+            v
+            for spec in resolved
+            for v in [*spec.model_params.values(), *spec.setup_params.values()]
         }
         proposed_by_derived: set[str] = set(self.derived.keys())
         self.param_universe = frozenset(
@@ -355,21 +590,33 @@ class Config(BaseModel):
             | declared_new_params
         )
 
-        # 7) Strict model_params RHS check: every non-raw RHS must be declared
-        # in new_params (typo guard + explicit proposal of new names).
+        # 7) Strict model_params / setup_params RHS check: every non-raw RHS
+        # must be declared in new_params (typo guard + explicit proposal of
+        # new names).
         allowed_rhs = self.raw_fork_fields | declared_new_params
         for spec in resolved:
-            for coef_name, gas_param in spec.model_params.items():
-                if gas_param in allowed_rhs:
-                    continue
-                hint = get_close_matches(gas_param, list(allowed_rhs), n=1)
-                suffix = f"; did you mean {hint[0]!r}?" if hint else ""
-                raise ConfigError(
-                    f"{spec.source_label} (test_name={spec.test_name!r}): "
-                    f"model_params[{coef_name!r}] = {gas_param!r} is not a raw "
-                    f"fork field on {self.gas_costs.fork!r} and is not declared "
-                    f"in new_params{suffix}"
-                )
+            for kind, params in (
+                ("model_params", spec.model_params),
+                ("setup_params", spec.setup_params),
+            ):
+                for coef_name, gas_param in params.items():
+                    if gas_param in allowed_rhs:
+                        continue
+                    hint = get_close_matches(gas_param, list(allowed_rhs), n=1)
+                    suffix = f"; did you mean {hint[0]!r}?" if hint else ""
+                    raise ConfigError(
+                        f"{spec.source_label} (test_name={spec.test_name!r}): "
+                        f"{kind}[{coef_name!r}] = {gas_param!r} is not a raw "
+                        f"fork field on {self.gas_costs.fork!r} and is not declared "
+                        f"in new_params{suffix}"
+                    )
+
+        # 7a) Pricing scenario names must be unique.
+        seen_scenarios: set[str] = set()
+        for scenario in self.pricing_scenarios:
+            if scenario.name in seen_scenarios:
+                raise ConfigError(f"duplicate pricing scenario name {scenario.name!r}")
+            seen_scenarios.add(scenario.name)
 
         # 8) Lenient derived-shadowing check.
         for name in self.derived:

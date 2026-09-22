@@ -214,7 +214,7 @@ def _smoke_fixtures_for(spec: ModelSpec) -> list[FixtureSpec]:
                 block_limit_million=bl,
                 target_opcode=target_opcode,
                 target_opcount=bl * _OPCOUNT_PER_MILLION,
-                count_source_opcode="STATICCALL" if is_precompile else None,
+                count_source_opcode=spec.target_operation_count_source,
                 omit_opcode_token=is_precompile,
             )
         )

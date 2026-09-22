@@ -11,10 +11,11 @@ Mixed-glue opcodes appear both as targets and as glues. They are fit per
 the LHS is pre-adjusted by subtracting the contribution of every priced
 upstream partner: for each partner ``p`` correlated with ``opcount`` on
 this spec's driver test (per the detector's ratio table), subtract
-``glue_runtime_ms_p · partner_count_per_fixture``. ``mixed_a`` opcodes
-allow partners from ``pure ∪ cycle``; ``mixed_b`` opcodes also allow
-``mixed_a`` partners. The four-pass order over the tier sequence makes
-the dependency static — no topological sort, no cycle detection.
+``glue_runtime_ms_p · partner_count_per_fixture``. Bootstrap replicates use
+the partner's aligned draws, preserving shared session covariance. ``mixed_a``
+opcodes allow partners from ``pure ∪ cycle``; ``mixed_b`` opcodes also allow
+``mixed_a`` partners. The four-pass order over the tier sequence makes the
+dependency static — no topological sort, no cycle detection.
 
 Specs without a driver fixture (``spec.test_name is None``) are skipped
 silently; ``validate_inputs`` already emitted the warning at load time.
@@ -93,6 +94,12 @@ def _canonical_count(slice_df: pd.DataFrame, spec: GlueOpcodeSpec) -> np.ndarray
     return slice_df[cols].astype(float).sum(axis=1).to_numpy()
 
 
+def _session_groups(frame: pd.DataFrame, config: Config) -> pd.Series | None:
+    """Return campaign session clusters when the driver rows carry them."""
+    column = config.campaign.session_column
+    return frame[column] if column in frame.columns else None
+
+
 def _pure_fit(
     fixtures_df: pd.DataFrame,
     config: Config,
@@ -128,6 +135,7 @@ def _pure_fit(
             target="test_runtime_ms",
             n_bootstrap=config.modeling.bootstrap_iterations,
             random_seed=config.modeling.random_seed,
+            groups=_session_groups(slice_df, config),
         )
     except Exception as exc:  # noqa: BLE001 -- broad on purpose: any numerical failure means this fit attempt is unfit, not a crash
         _log.warning(
@@ -172,6 +180,7 @@ def _cycle_fit(
             target="test_runtime_ms",
             n_bootstrap=config.modeling.bootstrap_iterations,
             random_seed=config.modeling.random_seed,
+            groups=_session_groups(combined, config),
         )
     except Exception as exc:  # noqa: BLE001 -- broad on purpose: any numerical failure means this fit attempt is unfit, not a crash
         _log.warning("glue cycle-fit failed: client=%s exc=%s", client, exc)
@@ -247,7 +256,17 @@ def _mixed_fit(
         )
         return None
 
-    adjusted = slice_df["test_runtime_ms"].astype(float).to_numpy().copy()
+    runtimes = slice_df["test_runtime_ms"].astype(float).to_numpy()
+    adjusted = runtimes.copy()
+    target_groups = _session_groups(slice_df, config)
+    target_sessions = (
+        None
+        if target_groups is None
+        else frozenset(str(group) for group in pd.unique(target_groups))
+    )
+    bootstrap_partners: list[tuple[np.ndarray, np.ndarray]] = []
+    uncertainty_conditional = False
+    bootstrap_rng = np.random.default_rng(config.modeling.random_seed)
     # Each candidate partner contributes only if its per-client fit passed
     # both the p-value and R² gates. Missing partners or partners that fail
     # either gate are skipped silently — the omission is already auditable
@@ -269,7 +288,54 @@ def _mixed_fit(
         if partner_pval >= p_threshold or partner_r2 < r2_threshold:
             continue
         partner_count = _canonical_count(slice_df, SPEC_BY_NAME[partner_name])
-        adjusted = adjusted - partner_ms * partner_count
+        adjusted -= partner_ms * partner_count
+
+        partner_sessions = partner_fit.session_ids
+        if partner_fit.uncertainty_conditional:
+            uncertainty_conditional = True
+            continue
+        paired_by_session = (
+            target_sessions is not None and target_sessions == partner_sessions
+        )
+        if target_sessions is None and partner_sessions is None:
+            partner_draws = partner_fit.bootstrap_draws(partner_name)
+        elif target_sessions is None or partner_sessions is None:
+            uncertainty_conditional = True
+            continue
+        elif paired_by_session:
+            partner_draws = partner_fit.bootstrap_draw_matrix(partner_name)
+            if len(partner_draws) != config.modeling.bootstrap_iterations:
+                uncertainty_conditional = True
+                continue
+        elif target_sessions & partner_sessions:
+            uncertainty_conditional = True
+            continue
+        else:
+            partner_draws = partner_fit.bootstrap_draws(partner_name)
+        if len(partner_draws) == 0:
+            uncertainty_conditional = True
+            continue
+        if not paired_by_session:
+            partner_draws = partner_draws[
+                bootstrap_rng.integers(
+                    0,
+                    len(partner_draws),
+                    size=config.modeling.bootstrap_iterations,
+                )
+            ]
+        bootstrap_partners.append((partner_count, partner_draws))
+
+    bootstrap_target = None
+    if bootstrap_partners and not uncertainty_conditional:
+
+        def bootstrap_target(iteration: int) -> np.ndarray | None:
+            bootstrap_runtimes = runtimes.copy()
+            for partner_count, partner_draws in bootstrap_partners:
+                partner_draw = partner_draws[iteration]
+                if not np.isfinite(partner_draw):
+                    return None
+                bootstrap_runtimes -= partner_draw * partner_count
+            return bootstrap_runtimes
 
     design = pd.DataFrame(
         {
@@ -284,6 +350,9 @@ def _mixed_fit(
             target="test_runtime_ms",
             n_bootstrap=config.modeling.bootstrap_iterations,
             random_seed=config.modeling.random_seed,
+            groups=target_groups,
+            bootstrap_target=bootstrap_target,
+            uncertainty_conditional=uncertainty_conditional,
         )
     except Exception as exc:  # noqa: BLE001 -- broad on purpose: any numerical failure means this fit attempt is unfit, not a crash
         _log.warning(
@@ -333,6 +402,7 @@ def estimate_glue(config: Config, fixtures_df: pd.DataFrame) -> GlueEstimateOutp
         fixtures_df,
         config.resolved_models,
         config.glue_adjustment.ratio_corr_eps,
+        config.campaign.session_column,
     )
 
     rows: list[dict[str, object]] = []
