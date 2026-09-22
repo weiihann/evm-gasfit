@@ -1,17 +1,17 @@
 """End-to-end: precompile specs disambiguated by synthetic target_operation.
 
-Precompiles have no dedicated opcode mnemonic in ``opcounts.json`` — they are
-invoked via ``STATICCALL``. A spec sets ``target_operation`` to the
-precompile's display name (e.g. ``BLS12_G1ADD``) and
-``target_operation_count_source`` to ``STATICCALL`` to point the opcount
-invariant at the actual column.
+Precompiles have no dedicated opcode mnemonic in ``opcounts.json``. A worker
+records the actual destination invocation under
+``PRECOMPILE_0x<20-byte-address>``; wrapper ``STATICCALL`` totals are distinct
+execution work and must not stand in for that semantic count. A spec keeps the
+human-readable ``target_operation`` and points
+``target_operation_count_source`` at the address-specific counter.
 
-This test exercises two precompile specs that share ``test_name``, ``model_by``
-shape (empty), and count source (``STATICCALL``) but differ in
-``target_operation`` and ``filter_by``. Each variant is synthesized with a
-different true slope; if the aggregator were unable to distinguish the specs,
-both ``PRECOMPILE_*`` rows in ``new_gas.csv`` would collapse to the larger
-slope. The test asserts they don't.
+This test exercises two precompile specs that share ``test_name`` and
+``model_by`` shape but use separate semantic counters. Each variant is
+synthesized with a different true slope; if the aggregator were unable to
+distinguish the specs, both ``PRECOMPILE_*`` rows in ``new_gas.csv`` would
+collapse to the larger slope. The test asserts they don't.
 """
 
 from __future__ import annotations
@@ -37,10 +37,11 @@ def _precompile_fixtures(
     *,
     target_opcode: str,
     variant_token: str,
+    count_source: str,
     block_limits: Sequence[int] = (30, 60, 90, 120, 150, 180, 210, 240),
     target_opcount_per_million: float = 100_000.0,
 ) -> list[FixtureSpec]:
-    """Build BLS-style precompile fixtures: STATICCALL == opcount, variant token in params."""
+    """Build BLS-style fixtures with a semantic precompile count."""
     key, _, value = variant_token.partition("_")
     fixtures: list[FixtureSpec] = []
     for bl in block_limits:
@@ -52,7 +53,7 @@ def _precompile_fixtures(
                 block_limit_million=bl,
                 target_opcode=target_opcode,
                 target_opcount=bl * target_opcount_per_million,
-                count_source_opcode="STATICCALL",
+                count_source_opcode=count_source,
                 omit_opcode_token=True,
             )
         )
@@ -61,10 +62,14 @@ def _precompile_fixtures(
 
 def test_precompile_count_source_isolates_specs(tmp_path: Path) -> None:
     g1add_fixtures = _precompile_fixtures(
-        target_opcode="BLS12_G1ADD", variant_token="bls12_g1add"
+        target_opcode="BLS12_G1ADD",
+        variant_token="bls12_g1add",
+        count_source="PRECOMPILE_0x000000000000000000000000000000000000000b",
     )
     g2add_fixtures = _precompile_fixtures(
-        target_opcode="BLS12_G2ADD", variant_token="bls12_g2add"
+        target_opcode="BLS12_G2ADD",
+        variant_token="bls12_g2add",
+        count_source="PRECOMPILE_0x000000000000000000000000000000000000000d",
     )
 
     g1add_slope = 1.0e-5
@@ -101,14 +106,14 @@ def test_precompile_count_source_isolates_specs(tmp_path: Path) -> None:
             {
                 "test_name": "test_bls12_381",
                 "target_operation": "BLS12_G1ADD",
-                "target_operation_count_source": "STATICCALL",
+                "target_operation_count_source": "PRECOMPILE_0x000000000000000000000000000000000000000b",
                 "filter_by": ["bls12_g1add"],
                 "model_params": {"target_coef": "PRECOMPILE_BLS12_G1ADD"},
             },
             {
                 "test_name": "test_bls12_381",
                 "target_operation": "BLS12_G2ADD",
-                "target_operation_count_source": "STATICCALL",
+                "target_operation_count_source": "PRECOMPILE_0x000000000000000000000000000000000000000d",
                 "filter_by": ["bls12_g2add"],
                 "model_params": {"target_coef": "PRECOMPILE_BLS12_G2ADD"},
             },
@@ -142,9 +147,8 @@ def test_precompile_count_source_isolates_specs(tmp_path: Path) -> None:
     g2_gas = new_gas[new_gas["gas_param"] == "PRECOMPILE_BLS12_G2ADD"].iloc[0]
     assert float(g1_gas["runtime_ms"]) == pytest.approx(g1add_slope, rel=0.05)
     assert float(g2_gas["runtime_ms"]) == pytest.approx(g2add_slope, rel=0.05)
-    # The visible cross-contamination check: if the aggregator matched specs
-    # by (test_name, target_opcode=STATICCALL) only, both rows would collapse
-    # onto the larger g2add_slope.
+    # The visible cross-contamination check: source labels and semantic
+    # target counters keep the two variants isolated.
     assert float(g1_gas["runtime_ms"]) < float(g2_gas["runtime_ms"])
     assert g1_gas["selected_opcode"] == "BLS12_G1ADD"
     assert g2_gas["selected_opcode"] == "BLS12_G2ADD"

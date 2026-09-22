@@ -135,3 +135,28 @@ def test_minimal_pipeline_end_to_end(tmp_path: Path) -> None:
     assert int(add_row["new_gas_rounded"]) == math.ceil(
         float(add_row["new_gas_decimal"])
     )
+
+
+def test_prague_current_gas_comparison_end_to_end(tmp_path: Path) -> None:
+    """A Prague run compares measurements against Prague's fork baseline."""
+    fixtures = make_block_limit_fixtures(
+        test_file="test_arithmetic",
+        test_name="test_arithmetic",
+        target_opcode="ADD",
+        params={"opcode": "ADD"},
+    )
+    config = base_config(anchor_rate=1.0e8, clients=("geth",))
+    config["gas_costs"]["fork"] = "prague"
+    config_yaml, runtimes_csv, opcounts_json, out_dir = write_standard_inputs(
+        tmp_path,
+        fixtures=fixtures,
+        models={"geth": ClientModel(intercept=100.0, slope=1.0e-5)},
+        config=config,
+    )
+
+    run_pipeline(config_yaml, runtimes_csv, opcounts_json, out_dir)
+
+    comparison = pd.read_csv(out_dir / "compute_gas_comparison.csv")
+    add_row = comparison[comparison["gas_param"] == "OPCODE_ADD"].iloc[0]
+    assert int(add_row["current_gas"]) == 3
+    assert add_row["current_gas_source"] == "fork"

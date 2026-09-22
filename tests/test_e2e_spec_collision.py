@@ -106,7 +106,7 @@ def test_filter_by_only_collision_does_not_duplicate_or_contaminate(
     assert not gas_rows.duplicated(subset=key).any()
 
     # Exactly one winner per (gas_param, client): the across-strategy worst case.
-    winners = gas_rows[gas_rows["is_winner"] == True]
+    winners = gas_rows[gas_rows["is_winner"].eq(True)]
     assert len(winners) == 2
     assert set(winners["client_name"]) == {"geth", "besu"}
 

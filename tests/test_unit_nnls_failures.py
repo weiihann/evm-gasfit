@@ -18,7 +18,12 @@ from scipy.optimize import nnls as _real_nnls
 
 from evm_gasfit.config import Config
 from evm_gasfit.errors import ModelingError
+from evm_gasfit.glue.adjust import _propagated_interval
 from evm_gasfit.modeling import nnls as nnls_module
+from evm_gasfit.modeling.diagnostics import (
+    leave_one_group_out_error,
+    leave_one_point_out_error,
+)
 from evm_gasfit.modeling.estimate import estimate_models
 from evm_gasfit.modeling.nnls import fit_nnls
 
@@ -97,6 +102,102 @@ def _make_fixtures_df(
                 raise ValueError(f"extra_cols[{name!r}] length mismatch")
             df[name] = [float(v) for v in values]
     return df
+
+
+# ---------------------------------------------------------------------------
+# Holdout diagnostics must reject incomplete refit evidence.
+# ---------------------------------------------------------------------------
+
+
+def test_session_holdout_is_nan_when_any_real_refit_loses_rank() -> None:
+    X = np.array([[1.0, 1.0], [1.0, 2.0], [1.0, 3.0]])
+    y = np.array([3.0, 5.0, 7.0])
+    groups = np.array(["a", "a", "b"])
+
+    # Holding out session ``a`` leaves only one row. The remaining fold cannot
+    # identify intercept and slope, so a successful ``b`` fold must not mask it.
+    assert np.isnan(leave_one_group_out_error(X, y, groups))
+
+
+def test_workload_holdout_is_nan_when_any_real_refit_loses_rank() -> None:
+    X = np.array([[1.0, 1.0], [1.0, 1.0], [1.0, 2.0]])
+    y = np.array([3.0, 3.0, 5.0])
+    opcount = X[:, 1]
+
+    # Both workload-point holdouts leave a constant design. This is a real
+    # numerical precondition failure, not a mocked solver error.
+    assert np.isnan(leave_one_point_out_error(X, y, opcount))
+
+
+def test_single_session_keeps_point_estimate_without_row_bootstrap() -> None:
+    design = pd.DataFrame(
+        {
+            "opcount": [1.0, 2.0, 3.0, 4.0],
+            "test_runtime_ms": [3.0, 5.0, 7.0, 9.0],
+        }
+    )
+
+    fit = fit_nnls(
+        design,
+        features=["opcount"],
+        target="test_runtime_ms",
+        n_bootstrap=20,
+        random_seed=7,
+        groups=np.array(["only-session"] * len(design)),
+    )
+
+    assert fit.params["opcount"] == pytest.approx(2.0)
+    assert len(fit.bootstrap_draws("opcount")) == 0
+
+
+def test_shared_session_glue_interval_pairs_matching_bootstrap_replicates() -> None:
+    groups = np.array(["session-a"] * 4 + ["session-b"] * 4)
+    counts = np.tile(np.arange(1.0, 5.0), 2)
+    target_design = pd.DataFrame(
+        {
+            "opcount": counts,
+            "test_runtime_ms": 2.0 + 3.0 * counts + np.repeat([0.0, 1.0], 4),
+        }
+    )
+    glue_design = pd.DataFrame(
+        {
+            "POP": counts,
+            "test_runtime_ms": 1.0 + 0.5 * counts + np.repeat([0.0, 0.3], 4),
+        }
+    )
+    target = fit_nnls(
+        target_design,
+        features=["opcount"],
+        target="test_runtime_ms",
+        n_bootstrap=40,
+        random_seed=11,
+        groups=groups,
+    )
+    glue = fit_nnls(
+        glue_design,
+        features=["POP"],
+        target="test_runtime_ms",
+        n_bootstrap=40,
+        random_seed=11,
+        groups=groups,
+    )
+
+    low, high, conditional = _propagated_interval(
+        target_fit=target,
+        partners=[(1.0, glue, "POP")],
+        confidence_level=0.95,
+        rng=np.random.default_rng(19),
+        point_adjustment=0.0,
+        point_target=float(target.params["opcount"]),
+    )
+
+    target_draws = target.bootstrap_draw_matrix("opcount")
+    glue_draws = glue.bootstrap_draw_matrix("POP")
+    valid = np.isfinite(target_draws) & np.isfinite(glue_draws)
+    adjusted = np.maximum(0.0, target_draws[valid] - glue_draws[valid])
+    assert conditional is False
+    assert low == pytest.approx(np.quantile(adjusted, 0.025))
+    assert high == pytest.approx(np.quantile(adjusted, 0.975))
 
 
 # ---------------------------------------------------------------------------

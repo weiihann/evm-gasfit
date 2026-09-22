@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
 from _data_synth import (
@@ -298,6 +300,129 @@ def test_glue_mixed_a_recovers_planted_slope_after_partner_subtraction(
     assert float(add_modelspec["target_coef_runtime_ms"]) == pytest.approx(
         add_per_count + 0.5 * iszero_per_count, rel=0.05
     )
+
+
+def test_mixed_glue_partner_draws_reach_adjusted_target_interval() -> None:
+    """A mixed fit preserves its upstream partner uncertainty downstream."""
+    from evm_gasfit.glue.adjust import compute_glue_adjustment
+    from evm_gasfit.glue.estimate import _mixed_fit
+    from evm_gasfit.glue.required import SPEC_BY_NAME
+    from evm_gasfit.modeling.results import NNLSResults
+
+    n_bootstrap = 100
+    groups = np.array(["a", "a", "b", "b"])
+    mstore_counts = np.array([1.0, 2.0, 1.0, 2.0])
+    iszero_counts = np.array([1.0, 4.0, 1.0, 4.0])
+    partner_draws = np.column_stack(
+        [np.zeros(n_bootstrap), np.tile([1.0, 3.0], n_bootstrap // 2)]
+    )
+    iszero_fit = NNLSResults(
+        X=np.column_stack([np.ones(4), mstore_counts]),
+        y=2.0 * mstore_counts,
+        y_name="test_runtime_ms",
+        coefficients=np.array([0.0, 2.0]),
+        bootstrap_coefs=partner_draws,
+        feature_names=["const", "ISZERO"],
+        residual_norm=0.0,
+        groups=groups,
+    )
+    mixed_slice = pd.DataFrame(
+        {
+            "client_name": "geth",
+            "test_name": "test_memory_access",
+            "param_opcode": "MSTORE",
+            "test_runtime_ms": 10.0 + 5.0 * mstore_counts + 2.0 * iszero_counts,
+            "MSTORE": mstore_counts,
+            "ISZERO": iszero_counts,
+            "session_id": groups,
+        }
+    )
+    config = SimpleNamespace(
+        modeling=SimpleNamespace(
+            bootstrap_iterations=n_bootstrap,
+            random_seed=7,
+        ),
+        campaign=SimpleNamespace(session_column="session_id"),
+    )
+    mstore_fit = _mixed_fit(
+        mixed_slice,
+        config,
+        "geth",
+        SPEC_BY_NAME["MSTORE"],
+        {("geth", "ISZERO"): iszero_fit},
+        pd.DataFrame(
+            [
+                {
+                    "test_name": "test_memory_access",
+                    "target_opcode": "MSTORE",
+                    "glue_opcode": "ISZERO",
+                }
+            ]
+        ),
+        frozenset({"pure"}),
+        p_threshold=0.05,
+        r2_threshold=0.5,
+    )
+    assert mstore_fit is not None
+
+    target_fit = NNLSResults(
+        X=np.column_stack([np.ones(4), mstore_counts]),
+        y=10.0 * mstore_counts,
+        y_name="test_runtime_ms",
+        coefficients=np.array([0.0, 10.0]),
+        bootstrap_coefs=np.column_stack(
+            [np.zeros(n_bootstrap), np.full(n_bootstrap, 10.0)]
+        ),
+        feature_names=["const", "opcount"],
+        residual_norm=0.0,
+        groups=groups,
+    )
+    adjusted = compute_glue_adjustment(
+        pd.DataFrame(
+            [
+                {
+                    "source_label": "keccak",
+                    "test_name": "test_keccak",
+                    "target_opcode": "KECCAK256",
+                    "client_name": "geth",
+                    "target_coef_runtime_ms": 10.0,
+                    "target_coef_conf_int_low": 10.0,
+                    "target_coef_conf_int_high": 10.0,
+                }
+            ]
+        ),
+        pd.DataFrame(
+            [
+                {
+                    "client_name": "geth",
+                    "glue_opcode": "MSTORE",
+                    "glue_runtime_ms": 5.0,
+                    "p_value": 0.01,
+                    "rsquared": 1.0,
+                }
+            ]
+        ),
+        pd.DataFrame(
+            [
+                {
+                    "test_name": "test_keccak",
+                    "target_opcode": "KECCAK256",
+                    "glue_opcode": "MSTORE",
+                    "corr": 1.0,
+                    "ratio": 1.0,
+                }
+            ]
+        ),
+        p_threshold=0.05,
+        r2_threshold=0.5,
+        target_fits={("keccak", "test_keccak", "KECCAK256", "geth"): target_fit},
+        glue_fits={("geth", "MSTORE"): mstore_fit},
+        random_seed=7,
+    ).iloc[0]
+
+    assert not bool(adjusted["glue_interval_conditional"])
+    assert float(adjusted["adjusted_target_coef_conf_int_low"]) == pytest.approx(2.0)
+    assert float(adjusted["adjusted_target_coef_conf_int_high"]) == pytest.approx(8.0)
 
 
 def test_glue_mixed_b_recovers_planted_slope_after_mixed_a_partner(

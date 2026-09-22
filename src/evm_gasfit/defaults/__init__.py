@@ -12,6 +12,7 @@ import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from difflib import get_close_matches
+from importlib import import_module
 
 from evm_gasfit.errors import ConfigError
 
@@ -21,19 +22,22 @@ _log = logging.getLogger(__name__)
 
 
 def _probe_execution_specs() -> bool:
-    """Return True iff ``ethereum/execution-specs`` is importable.
+    """Return True iff a supported execution-specs fork module imports.
 
-    Probes via a real ``import`` of a canary fork module so the result respects
-    any ``sys.modules`` overrides (used in tests). ``execution-specs`` ships
-    every fork together, so one fork's presence is a faithful proxy for the
-    whole package.
+    Current execution-specs packages forks below ``ethereum.forks``. Legacy
+    package paths remain canaries for existing Prague and Osaka installations.
     """
-    try:
-        import ethereum.osaka.vm.gas  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
+    for path in (
+        "ethereum.forks.prague.vm.gas",
+        "ethereum.prague.vm.gas",
+        "ethereum.osaka.vm.gas",
+    ):
+        try:
+            import_module(path)
+            return True
+        except ImportError:
+            continue
+    return False
 
 
 # Probe the optional extra once at import time; the whole run uses one source.

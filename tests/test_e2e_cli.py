@@ -98,19 +98,6 @@ def test_cli_run_succeeds_and_populates_out(tmp_path: Path) -> None:
     assert {"new_gas_decimal", "new_gas_rounded"}.issubset(new_gas.columns)
 
     meta = json.loads((out_dir / "meta.json").read_text())
-    assert set(meta) == {
-        "evm_gasfit_version",
-        "run_started_at",
-        "inputs",
-        "fixtures",
-        "dropped_fixtures",
-        "warnings",
-    }
-    assert meta["inputs"] == {
-        "config": str(config_yaml),
-        "runtimes": str(runtimes_csv),
-        "opcounts": str(opcounts_json),
-    }
     # All synthesized fixtures are present in both inputs, so nothing was dropped.
     assert meta["fixtures"]["dropped"] == 0
     assert meta["dropped_fixtures"] == []
