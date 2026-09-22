@@ -26,6 +26,8 @@ from _data_synth import (
     write_standard_inputs,
 )
 
+from evm_gasfit.errors import ConfigError
+
 _ACCOUNT_VALUE_SENT_SPEC = {
     "test_name": "test_account_access",
     "target_operation": "BALANCE",
@@ -139,6 +141,7 @@ def test_two_specs_can_share_derived_name_with_different_sources(
     config = base_config(
         models_custom=[_ACCOUNT_VALUE_SENT_SPEC, _SSTORE_REMAP_SPEC],
         new_params={"ACCOUNT_WRITE": None, "STORAGE_WRITE": None},
+        clients=("geth",),
     )
     config_yaml, runtimes_csv, opcounts_json, out_dir = write_standard_inputs(
         tmp_path,
@@ -166,6 +169,69 @@ def test_two_specs_can_share_derived_name_with_different_sources(
     assert expected.issubset(proposed), (
         f"new_gas.csv missing params: {expected - proposed}"
     )
+
+    qualification = pd.read_csv(out_dir / "qualification.csv")
+    assert set(qualification["status"]) == {"inconclusive"}
+    assert (
+        qualification["reasons"]
+        .str.contains("configured coefficient\\(s\\) were not estimated")
+        .all()
+    )
+
+
+def test_uncertainty_gate_rejects_zero_pinned_mapped_coefficient(
+    tmp_path: Path,
+) -> None:
+    """Every emitted mapped coefficient must satisfy an armed uncertainty gate."""
+    fixtures = cross_product_fixtures(
+        test_file="test_arithmetic",
+        test_name="test_arithmetic",
+        param_grid={"workload": ("0", "1", "2")},
+        target_opcode_for="ADD",
+        target_opcount_per_million=800_000,
+    )
+    config = base_config(
+        clients=("geth",),
+        models_custom=[
+            {
+                "test_name": "test_arithmetic",
+                "target_operation": "ADD",
+                "model_params": {"target_coef": "OPCODE_ADD"},
+                "setup_params": {"workload": "ACCOUNT_WRITE"},
+            }
+        ],
+        new_params={"ACCOUNT_WRITE": None},
+        extra={
+            "qualification": {
+                "max_relative_uncertainty": 0.1,
+                "enforce_fit_quality": True,
+            },
+            "derived": {"DERIVED_ACCOUNT_WRITE": "ACCOUNT_WRITE"},
+            "pricing_scenarios": [{"name": "strict", "anchor_rate": 100_000_000}],
+        },
+    )
+    config_yaml, runtimes_csv, opcounts_json, out_dir = write_standard_inputs(
+        tmp_path,
+        fixtures=fixtures,
+        models={"geth": ClientModel(intercept=80.0, slope=1.0e-5)},
+        config=config,
+        noise_pct=0.0,
+    )
+
+    run_pipeline(config_yaml, runtimes_csv, opcounts_json, out_dir)
+
+    qualification = pd.read_csv(out_dir / "qualification.csv")
+    assert qualification.iloc[0]["status"] == "inconclusive"
+    assert (
+        "relative CI width for coefficient 'workload' is not computable"
+        in qualification.iloc[0]["reasons"]
+    )
+    assert "p-value for coefficient 'workload'" in qualification.iloc[0]["reasons"]
+
+    scenarios = pd.read_csv(out_dir / "pricing_scenarios.csv")
+    derived = scenarios[scenarios["gas_param"] == "DERIVED_ACCOUNT_WRITE"].iloc[0]
+    assert derived["qualification_status"] == "inconclusive"
+    assert pd.isna(derived["scenario_gas"])
 
 
 def test_unmapped_source_value_raises(tmp_path: Path) -> None:
@@ -202,3 +268,80 @@ def test_unmapped_source_value_raises(tmp_path: Path) -> None:
     with pytest.raises(ModelingError, match="values map omits observed"):
         gas_fit.estimate_models()
     assert not (out_dir / "results.csv").exists()
+
+
+def test_explicit_runtime_param_coalesces_with_fixture_identity(tmp_path: Path) -> None:
+    """CSV parameters can augment fixture identity without pandas suffixes."""
+    fixtures = _account_fixtures(values=("0", "1"))
+    config = base_config(
+        models_custom=[
+            {
+                "test_name": "test_account_access",
+                "target_operation": "BALANCE",
+                "model_by": "workload_shape",
+                "model_params": {"target_coef": "COLD_ACCOUNT_ACCESS"},
+            }
+        ],
+        clients=("geth",),
+    )
+    config_yaml, runtimes_csv, opcounts_json, out_dir = write_standard_inputs(
+        tmp_path,
+        fixtures=fixtures,
+        models={"geth": ClientModel(intercept=70.0, slope=1.0e-5)},
+        config=config,
+        noise_pct=0.0,
+    )
+    value_by_fixture = {
+        fixture.fixture_name: int(fixture.params["value_sent"]) for fixture in fixtures
+    }
+    runtimes = pd.read_csv(runtimes_csv)
+    runtimes["param_value_sent"] = runtimes["fixture_name"].map(value_by_fixture)
+    runtimes["param_workload_shape"] = runtimes["param_value_sent"].map(
+        {0: "small", 1: "large"}
+    )
+    runtimes.to_csv(runtimes_csv, index=False)
+
+    from evm_gasfit import GasFit
+
+    gas_fit = GasFit.from_config(config_yaml)
+    gas_fit.load_runtimes(runtimes_csv)
+    gas_fit.load_opcounts(opcounts_json)
+    gas_fit.estimate_models()
+    gas_fit.build_proposal()
+    gas_fit.write_reports(out_dir)
+
+    assert gas_fit.fixtures_df is not None
+    assert "param_value_sent" in gas_fit.fixtures_df
+    assert "param_workload_shape" in gas_fit.fixtures_df
+    assert "param_value_sent_x" not in gas_fit.fixtures_df
+    assert "param_value_sent_y" not in gas_fit.fixtures_df
+    results = pd.read_csv(out_dir / "results.csv")
+    assert set(results["param_workload_shape"]) == {"small", "large"}
+
+
+def test_explicit_runtime_param_conflict_is_rejected(tmp_path: Path) -> None:
+    """CSV facts cannot contradict the fixture-name identity."""
+    fixtures = _account_fixtures(values=("0",))
+    config = base_config(
+        models_custom=[
+            {
+                "test_name": "test_account_access",
+                "target_operation": "BALANCE",
+                "model_params": {"target_coef": "COLD_ACCOUNT_ACCESS"},
+            }
+        ],
+        clients=("geth",),
+    )
+    config_yaml, runtimes_csv, opcounts_json, out_dir = write_standard_inputs(
+        tmp_path,
+        fixtures=fixtures,
+        models={"geth": ClientModel(intercept=70.0, slope=1.0e-5)},
+        config=config,
+        noise_pct=0.0,
+    )
+    runtimes = pd.read_csv(runtimes_csv)
+    runtimes["param_value_sent"] = 999
+    runtimes.to_csv(runtimes_csv, index=False)
+
+    with pytest.raises(ConfigError, match="param_value_sent.*conflicts"):
+        run_pipeline(config_yaml, runtimes_csv, opcounts_json, out_dir)

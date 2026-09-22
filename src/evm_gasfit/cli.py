@@ -33,8 +33,24 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--config", required=True, type=Path)
     run_p.add_argument("--runtimes", required=True, type=Path)
     run_p.add_argument("--opcounts", required=True, type=Path)
+    run_p.add_argument(
+        "--manifest",
+        required=False,
+        type=Path,
+        default=None,
+        help="Optional campaign manifest JSON; embedded into analysis_status.json",
+    )
     run_p.add_argument("--out", required=True, type=Path)
     run_p.set_defaults(func=_run)
+
+    compare_p = sub.add_parser(
+        "compare-campaigns",
+        help="Compare two completed analysis directories (manifest-aware)",
+    )
+    compare_p.add_argument("--baseline", required=True, type=Path)
+    compare_p.add_argument("--candidate", required=True, type=Path)
+    compare_p.add_argument("--out", required=True, type=Path)
+    compare_p.set_defaults(func=_compare_campaigns)
 
     prepare_eest_p = sub.add_parser(
         "prepare-eest",
@@ -58,11 +74,23 @@ def _run(args: argparse.Namespace) -> int:
     fit = GasFit.from_config(Path(args.config))
     fit.load_runtimes(Path(args.runtimes))
     fit.load_opcounts(Path(args.opcounts))
+    if args.manifest is not None:
+        fit.load_manifest(Path(args.manifest))
     fit.estimate_models()
     if fit.config.glue_adjustment.enabled:
         fit.estimate_glue()
     fit.build_proposal()
     fit.write_reports(Path(args.out))
+    return 0
+
+
+def _compare_campaigns(args: argparse.Namespace) -> int:
+    from evm_gasfit.campaign import compare_campaigns
+
+    summary = compare_campaigns(
+        Path(args.baseline), Path(args.candidate), Path(args.out)
+    )
+    print(f"verdict: {summary['verdict']}; {summary['rows']} parameter row(s) compared")
     return 0
 
 

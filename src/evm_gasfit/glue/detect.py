@@ -60,7 +60,7 @@ _NON_OPCODE_COLUMNS: frozenset[str] = frozenset(
 
 
 def _spec_groups(
-    fixtures_df: pd.DataFrame, spec: ModelSpec
+    fixtures_df: pd.DataFrame, spec: ModelSpec, session_column: str = "session_id"
 ) -> list[tuple[dict[str, object], pd.DataFrame]]:
     """Yield ``(group_values, group_df)`` per spec slice; empty when filters drop everything."""
     slice_df = fixtures_df[fixtures_df["test_name"] == spec.test_name]
@@ -68,7 +68,8 @@ def _spec_groups(
     if slice_df.empty:
         return []
     slice_df = _resolve_target_opcode(slice_df, spec)
-    slice_df = _split_baseline_pair(slice_df, spec)
+    pairing_session = session_column if session_column in slice_df.columns else None
+    slice_df = _split_baseline_pair(slice_df, spec, pairing_session)
     slice_df = _materialize_derived(slice_df, spec)
 
     for col in spec.model_by:
@@ -89,26 +90,27 @@ def _spec_groups(
 def _canonical_columns(
     agg: pd.DataFrame,
     target_opcode: str,
+    opcode_columns: set[str],
     count_source: str | None = None,
 ) -> dict[str, np.ndarray]:
-    """Fold per-mnemonic opcount columns into canonical-name sums.
+    """Fold actual EVM opcode count columns into canonical-name sums.
 
-    The target opcode is excluded from every family sum so a target that
-    happens to be a family member (e.g. ``DUP3``) cannot spuriously match
-    its own canonical family. The count source, when set (precompile specs),
-    is also excluded — the invariant forces ``corr == 1`` against opcount,
-    so it would trivially match every threshold despite being the work being
-    measured rather than glue.
+    CSV metadata may be numeric, but it is not execution work. The fixture
+    builder records the exact opcount columns from the JSON mapping, which is
+    the sole candidate universe here. Semantic precompile counters are target
+    evidence, not opcode glue, and are excluded even if they happen to vary
+    with the sweep.
     """
-    excluded = {target_opcode}
+    excluded = {"opcount", target_opcode}
     if count_source is not None:
         excluded.add(count_source)
     raw_cols = [
-        c
-        for c in agg.columns
-        if c not in _NON_OPCODE_COLUMNS
-        and c not in excluded
-        and pd.api.types.is_numeric_dtype(agg[c])
+        column
+        for column in opcode_columns
+        if column in agg.columns
+        and column not in excluded
+        and not column.startswith("PRECOMPILE_")
+        and pd.api.types.is_numeric_dtype(agg[column])
     ]
     members_by_canonical: dict[str, list[str]] = {}
     for col in raw_cols:
@@ -141,6 +143,7 @@ def compute_glue_opcodes_by_test(
     fixtures_df: pd.DataFrame,
     model_specs: Iterable[ModelSpec],
     eps: float,
+    session_column: str = "session_id",
 ) -> pd.DataFrame:
     """Compute the per-test glue opcode ratio table.
 
@@ -157,10 +160,11 @@ def compute_glue_opcodes_by_test(
     model_by_cols: list[str] = sorted(
         {c for spec in model_specs for c in spec.model_by}
     )
+    opcode_columns = set(fixtures_df.attrs.get("opcode_columns", []))
     rows: list[dict[str, object]] = []
 
     for spec in model_specs:
-        for group_values, group_df in _spec_groups(fixtures_df, spec):
+        for group_values, group_df in _spec_groups(fixtures_df, spec, session_column):
             # Opcounts are a property of the fixture, not the client — collapse
             # to one row per fixture before correlating. Sorting by opcount
             # keeps the endpoint-based ratio (np.diff().mean()) well-defined.
@@ -174,7 +178,10 @@ def compute_glue_opcodes_by_test(
             target_opcode = agg["target_opcode"].iloc[0]
             opcount = agg["opcount"].astype(float).to_numpy()
             for canonical, counts in _canonical_columns(
-                agg, target_opcode, spec.target_operation_count_source
+                agg,
+                target_opcode,
+                opcode_columns,
+                spec.target_operation_count_source,
             ).items():
                 keep, corr, ratio = _passes_thresholds(counts, opcount, eps)
                 if not keep:
@@ -210,9 +217,12 @@ def detect_missing_glue(
     fixtures_df: pd.DataFrame,
     model_specs: Iterable[ModelSpec],
     eps: float,
+    session_column: str = "session_id",
 ) -> list[tuple[str, str]]:
     """Return sorted ``(test_name, glue_opcode)`` pairs that meet the thresholds but aren't priced."""
-    glue_df = compute_glue_opcodes_by_test(fixtures_df, model_specs, eps)
+    glue_df = compute_glue_opcodes_by_test(
+        fixtures_df, model_specs, eps, session_column
+    )
     if glue_df.empty:
         return []
     priced = set(PRICED_GLUE_OPCODES)

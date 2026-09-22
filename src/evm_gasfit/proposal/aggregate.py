@@ -28,10 +28,11 @@ def _lookup_glue_adjustment(
     model_by: list[str],
     model_by_values: dict[str, object],
     client: str,
-) -> tuple[float, float | None, float | None, float | None]:
-    """Return (adjustment, adjusted_runtime, adjusted_low, adjusted_high) or zeros."""
+) -> tuple[float, float | None, float | None, float | None, bool]:
+    """Return (adjustment, adjusted_runtime, adjusted_low, adjusted_high,
+    interval_conditional) or zeros."""
     if glue_adjustment_df is None or glue_adjustment_df.empty:
-        return 0.0, None, None, None
+        return 0.0, None, None, None, False
     mask = (
         (glue_adjustment_df["test_name"] == test_name)
         & (glue_adjustment_df["target_opcode"] == target_opcode)
@@ -47,32 +48,71 @@ def _lookup_glue_adjustment(
             mask &= glue_adjustment_df[col] == model_by_values[col]
     sub = glue_adjustment_df[mask]
     if sub.empty:
-        return 0.0, None, None, None
+        return 0.0, None, None, None, False
     row = sub.iloc[0]
+    conditional = (
+        bool(row["glue_interval_conditional"])
+        if "glue_interval_conditional" in glue_adjustment_df.columns
+        and pd.notna(row.get("glue_interval_conditional"))
+        else False
+    )
     return (
         float(row["glue_adjustment"]),
         float(row["adjusted_target_coef_runtime_ms"]),
         float(row["adjusted_target_coef_conf_int_low"]),
         float(row["adjusted_target_coef_conf_int_high"]),
+        conditional,
     )
+
+
+def _qualification_lookup(
+    config: Config, qualification_df: pd.DataFrame | None
+) -> dict[tuple, tuple[str, str]]:
+    """Map exact fit identities to slope and adjusted-estimate statuses."""
+    if qualification_df is None or qualification_df.empty:
+        return {}
+    specs = {spec.source_label: spec for spec in config.resolved_models}
+    out: dict[tuple, tuple[str, str]] = {}
+    for _, row in qualification_df.iterrows():
+        spec = specs.get(str(row["source_label"]))
+        if spec is None:
+            continue
+        key = (
+            str(row["source_label"]),
+            str(row["test_name"]),
+            str(row["target_opcode"]),
+            *[str(row[column]) for column in sorted(spec.model_by)],
+            str(row["client_name"]),
+        )
+        out[key] = (
+            str(row.get("status", "")),
+            str(row.get("adjusted_estimate_status", "")),
+        )
+    return out
 
 
 def expand_to_per_client(
     results_df: pd.DataFrame,
     config: Config,
     glue_adjustment_df: pd.DataFrame | None,
+    qualification_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Expand one results_df row into N rows per ``model_params`` entry.
+    """Expand one results_df row into N rows per coefficient → gas-param map.
 
     Each ``results_df`` row is routed back to the exact spec that produced it
     via the ``source_label`` provenance column. This is a 1:1 join — two specs
     that share ``test_name`` + target + ``model_by`` (differing only in
     ``filter_by``) land on identical key columns but distinct ``source_label``
-    values, so neither expands the other's fit.
+    values, so neither expands the other's fit. Coefficients come from both
+    ``model_params`` (opcount interaction terms) and ``setup_params``
+    (n-independent terms); ``feature_kind`` records which. Without a pricing
+    anchor (``anchor_rate: null``) the ``new_gas_*`` columns are left empty —
+    the run is comparison-only and never invents a conversion rate.
     """
     model_by_cols = _all_model_by_cols(config)
-    anchor_rate = float(config.anchor_rate)
+    anchor_rate = config.anchor_rate
     specs_by_label = {spec.source_label: spec for spec in config.resolved_models}
+    qual = _qualification_lookup(config, qualification_df)
 
     rows: list[dict[str, object]] = []
     for _, res_row in results_df.iterrows():
@@ -80,12 +120,21 @@ def expand_to_per_client(
         model_by_values = {c: res_row[c] for c in spec.model_by}
         target_opcode = res_row["target_opcode"]
         client = res_row["client_name"]
+        qual_key = (
+            str(spec.source_label),
+            str(spec.test_name),
+            str(target_opcode),
+            *[str(model_by_values[c]) for c in sorted(spec.model_by)],
+            str(client),
+        )
+        slope_status, adjusted_status = qual.get(qual_key, ("", ""))
 
         (
             glue_adjustment,
             adj_runtime,
             adj_low,
             adj_high,
+            interval_conditional,
         ) = _lookup_glue_adjustment(
             glue_adjustment_df,
             spec.source_label,
@@ -96,59 +145,87 @@ def expand_to_per_client(
             client,
         )
 
-        for coef_name, gas_param in spec.model_params.items():
-            if coef_name == "target_coef":
-                if adj_runtime is not None:
-                    runtime_ms = adj_runtime
-                    ci_low = adj_low
-                    ci_high = adj_high
+        coefficient_maps = [
+            ("target", spec.model_params),
+            ("setup", spec.setup_params),
+        ]
+        for feature_kind, params in coefficient_maps:
+            for coef_name, gas_param in params.items():
+                if feature_kind == "target":
+                    if coef_name == "target_coef":
+                        if adj_runtime is not None:
+                            runtime_ms = adj_runtime
+                            ci_low = adj_low
+                            ci_high = adj_high
+                        else:
+                            runtime_ms = float(res_row["target_coef_runtime_ms"])
+                            ci_low = float(res_row["target_coef_conf_int_low"])
+                            ci_high = float(res_row["target_coef_conf_int_high"])
+                        pvalue = float(res_row["target_coef_pvalue"])
+                        row_glue_adjustment = float(glue_adjustment)
+                        row_status = adjusted_status or slope_status
+                    else:
+                        rt_col = f"{coef_name}_runtime_ms"
+                        if rt_col not in res_row.index:
+                            continue
+                        val = res_row[rt_col]
+                        if val is None or (isinstance(val, float) and np.isnan(val)):
+                            continue
+                        runtime_ms = float(val)
+                        pvalue = float(res_row[f"{coef_name}_pvalue"])
+                        ci_low = float(res_row[f"{coef_name}_conf_int_low"])
+                        ci_high = float(res_row[f"{coef_name}_conf_int_high"])
+                        row_glue_adjustment = 0.0
+                        row_status = slope_status
                 else:
-                    runtime_ms = float(res_row["target_coef_runtime_ms"])
-                    ci_low = float(res_row["target_coef_conf_int_low"])
-                    ci_high = float(res_row["target_coef_conf_int_high"])
-                pvalue = float(res_row["target_coef_pvalue"])
-                row_glue_adjustment = float(glue_adjustment)
-            else:
-                rt_col = f"{coef_name}_runtime_ms"
-                if rt_col not in res_row.index:
-                    continue
-                val = res_row[rt_col]
-                if val is None or (isinstance(val, float) and np.isnan(val)):
-                    continue
-                runtime_ms = float(val)
-                pvalue = float(res_row[f"{coef_name}_pvalue"])
-                ci_low = float(res_row[f"{coef_name}_conf_int_low"])
-                ci_high = float(res_row[f"{coef_name}_conf_int_high"])
-                row_glue_adjustment = 0.0
+                    rt_col = f"{coef_name}_runtime_ms"
+                    if rt_col not in res_row.index:
+                        continue
+                    val = res_row[rt_col]
+                    if val is None or (isinstance(val, float) and np.isnan(val)):
+                        continue
+                    runtime_ms = float(val)
+                    pvalue = float(res_row[f"{coef_name}_pvalue"])
+                    ci_low = float(res_row[f"{coef_name}_conf_int_low"])
+                    ci_high = float(res_row[f"{coef_name}_conf_int_high"])
+                    row_glue_adjustment = 0.0
+                    row_status = slope_status
 
-            new_gas_decimal = anchor_rate * runtime_ms / 1000.0
-            new_gas_rounded = math.ceil(new_gas_decimal)
-
-            out: dict[str, object] = {
-                "gas_param": gas_param,
-                "client_name": client,
-                "runtime_ms": runtime_ms,
-                "pvalue": pvalue,
-                "conf_int_low": ci_low,
-                "conf_int_high": ci_high,
-                "test_name": spec.test_name,
-                "target_opcode": target_opcode,
-                "model_coef_name": coef_name,
-                "source_label": spec.source_label,
-                "glue_adjustment": row_glue_adjustment,
-                "rsquared": float(res_row["rsquared"]),
-                "rsquared_adj": float(res_row["rsquared_adj"]),
-            }
-            for col in model_by_cols:
-                if col in spec.model_by:
-                    out[col] = model_by_values[col]
+                if anchor_rate is not None:
+                    new_gas_decimal = float(anchor_rate) * runtime_ms / 1000.0
+                    new_gas_rounded: int | None = math.ceil(new_gas_decimal)
                 else:
-                    out[col] = None
-            out["new_gas_decimal"] = new_gas_decimal
-            out["new_gas_rounded"] = new_gas_rounded
-            out["poor_fit"] = False
-            out["is_winner"] = False
-            rows.append(out)
+                    new_gas_decimal = float("nan")
+                    new_gas_rounded = None
+
+                out: dict[str, object] = {
+                    "gas_param": gas_param,
+                    "client_name": client,
+                    "runtime_ms": runtime_ms,
+                    "pvalue": pvalue,
+                    "conf_int_low": ci_low,
+                    "conf_int_high": ci_high,
+                    "test_name": spec.test_name,
+                    "target_opcode": target_opcode,
+                    "model_coef_name": coef_name,
+                    "source_label": spec.source_label,
+                    "feature_kind": feature_kind,
+                    "glue_adjustment": row_glue_adjustment,
+                    "glue_interval_conditional": interval_conditional,
+                    "qualification_status": row_status,
+                    "rsquared": float(res_row["rsquared"]),
+                    "rsquared_adj": float(res_row["rsquared_adj"]),
+                }
+                for col in model_by_cols:
+                    if col in spec.model_by:
+                        out[col] = model_by_values[col]
+                    else:
+                        out[col] = None
+                out["new_gas_decimal"] = new_gas_decimal
+                out["new_gas_rounded"] = new_gas_rounded
+                out["poor_fit"] = False
+                out["is_winner"] = False
+                rows.append(out)
 
     cols = (
         [
@@ -162,7 +239,10 @@ def expand_to_per_client(
             "target_opcode",
             "model_coef_name",
             "source_label",
+            "feature_kind",
             "glue_adjustment",
+            "glue_interval_conditional",
+            "qualification_status",
             "rsquared",
             "rsquared_adj",
         ]
@@ -198,12 +278,17 @@ def select_per_client_max(
     new_gas_all_df: pd.DataFrame,
     pvalue_threshold: float,
     rsquared_threshold: float,
+    block_unqualified: bool = False,
 ) -> pd.DataFrame:
     """Select the winning row per ``(gas_param, client_name)``.
 
     Qualified pool requires ``pvalue < pvalue_threshold`` **and**
     ``rsquared >= rsquared_threshold``. On fallback (no candidate qualifies)
-    the winner failed at least one of the two thresholds.
+    the winner failed at least one of the two thresholds. When
+    ``block_unqualified`` is set, the pool is further restricted to rows whose
+    qualification status is ``qualified`` (falling back to the fit-quality
+    pool, then to all candidates) — an unqualified winner still surfaces, but
+    the proposal stage clears its recommended value.
 
     Mutates the input frame: flags ``poor_fit = True`` on **every** candidate
     that fails either threshold (not just the chosen winner) so losing weak
@@ -235,7 +320,10 @@ def select_per_client_max(
             "target_opcode",
             "model_coef_name",
             "source_label",
+            "feature_kind",
             "glue_adjustment",
+            "glue_interval_conditional",
+            "qualification_status",
             "rsquared",
             "rsquared_adj",
             "new_gas_decimal",
@@ -256,6 +344,10 @@ def select_per_client_max(
             & (group["rsquared"] >= rsquared_threshold)
         ]
         sub = qualified if not qualified.empty else group
+        if block_unqualified and "qualification_status" in sub.columns:
+            qual_pool = sub[sub["qualification_status"] == "qualified"]
+            if not qual_pool.empty:
+                sub = qual_pool
         sub = sub.sort_values(
             by=[
                 "runtime_ms",
@@ -292,36 +384,38 @@ def select_across_client_max(per_client_df: pd.DataFrame) -> pd.DataFrame:
             "selected_test",
             "selected_opcode",
             "selected_model_coef_name",
+            "feature_kind",
             "glue_adjustment",
+            "glue_interval_conditional",
+            "qualification_status",
             "new_gas_decimal",
             "new_gas_rounded",
         ]
         return pd.DataFrame(columns=cols)
 
-    model_by_cols = [
-        c
-        for c in per_client_df.columns
-        if c
-        not in {
-            "gas_param",
-            "client_name",
-            "runtime_ms",
-            "pvalue",
-            "conf_int_low",
-            "conf_int_high",
-            "test_name",
-            "target_opcode",
-            "model_coef_name",
-            "source_label",
-            "glue_adjustment",
-            "rsquared",
-            "rsquared_adj",
-            "new_gas_decimal",
-            "new_gas_rounded",
-            "poor_fit",
-            "is_winner",
-        }
-    ]
+    reserved = {
+        "gas_param",
+        "client_name",
+        "runtime_ms",
+        "pvalue",
+        "conf_int_low",
+        "conf_int_high",
+        "test_name",
+        "target_opcode",
+        "model_coef_name",
+        "source_label",
+        "feature_kind",
+        "glue_adjustment",
+        "glue_interval_conditional",
+        "qualification_status",
+        "rsquared",
+        "rsquared_adj",
+        "new_gas_decimal",
+        "new_gas_rounded",
+        "poor_fit",
+        "is_winner",
+    }
+    model_by_cols = [c for c in per_client_df.columns if c not in reserved]
 
     chosen_rows: list[pd.Series] = []
     for _gp, group in per_client_df.groupby("gas_param", sort=True):
@@ -350,7 +444,10 @@ def select_across_client_max(per_client_df: pd.DataFrame) -> pd.DataFrame:
             "selected_test",
             "selected_opcode",
             "selected_model_coef_name",
+            "feature_kind",
             "glue_adjustment",
+            "glue_interval_conditional",
+            "qualification_status",
         ]
         + model_by_cols
         + ["new_gas_decimal", "new_gas_rounded"]

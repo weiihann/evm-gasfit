@@ -1,35 +1,13 @@
-"""End-to-end: `overhead_baseline_param` runtime-delta pairing.
+"""End-to-end: A/B baseline control pairing.
 
-A spec can declare `overhead_baseline_param` to pair each fixture where that
-param is `"False"` with its `"True"` counterpart (same params otherwise) and
-fit `target_coef` on the runtime delta (`False - True`) instead of raw
-`False` runtime. The `True` variant runs the same harness without the target
-opcode, so the delta cancels anything the two variants share.
+`overhead_baseline_param` pairs a ``False`` measurement with an aggregated
+``True`` control. The default shape key preserves legacy all-parameter
+matching; `overhead_baseline_match_params` can select no optional keys or a
+specific subset when control and work fixture IDs differ.
 
-Pairing alone only cancels a contaminant whose *count* is identical between
-the two variants (e.g. keccak on a cold account probe, which runs regardless
-of the target op). A contaminant that scales with the target's own opcount —
-e.g. the GAS/PUSH/POP calling-convention setup around a CALL, which the
-`True` baseline drops along with the target op itself — does *not* cancel in
-the raw delta. The per-opcode glue detector (`evm_gasfit.glue.detect`) runs
-on the same delta (every opcode-count column, not just runtime, per
-`modeling/estimate.py`'s `_split_baseline_pair`) rather than being skipped for
-baseline-paired specs, so it picks up exactly this case: a cancelling
-contaminant deltas to a constant and fails the correlation threshold on its
-own (never flagged, never double-subtracted); a scaling one survives the
-diff and gets detected and priced same as it would without pairing.
-
-Paths exercised:
-
-- A contaminant with an identical count in both variants cancels for free;
-  the recovered target_coef matches the clean planted slope rather than the
-  slope-plus-contamination a raw fit on the `False` fixtures alone would
-  recover, and it never appears in `glue_opcodes_by_test.csv`.
-- A contaminant whose count scales with the target's own opcount (present on
-  `False`, absent on `True`) survives the delta, gets flagged in
-  `glue_opcodes_by_test.csv`, and is subtracted by the ordinary per-opcode
-  glue mechanism to recover the clean planted slope.
-- A `False` fixture with no matching `True` counterpart raises `ConfigError`.
+Pairing differences runtime, `opcount`, and every opcode count before target
+validation. This removes fixed work shared by a native system tail while
+leaving variable calling-convention work available to glue detection.
 """
 
 from __future__ import annotations
@@ -169,6 +147,30 @@ def test_baseline_pair_cancels_shared_contamination(tmp_path: Path) -> None:
     assert float(probe_row["glue_adjustment"]) == 0.0
 
 
+def test_baseline_pair_accepts_csv_boolean_flags(tmp_path: Path) -> None:
+    """Explicit CSV booleans retain the fixed-work pairing contract."""
+    true_cost = 4.0e-5
+    config_yaml, runtimes_csv, opcounts_json, out_dir = write_standard_inputs(
+        tmp_path,
+        fixtures=_paired_fixtures() + make_glue_driver_fixtures(),
+        models={"geth": ClientModel(intercept=50.0, slope=true_cost)},
+        config=_paired_config(),
+        seed=43,
+        noise_pct=0.0,
+    )
+    runtimes = pd.read_csv(runtimes_csv)
+    runtimes["param_overhead_baseline"] = runtimes["fixture_name"].str.contains(
+        "overhead_baseline_True"
+    )
+    runtimes.to_csv(runtimes_csv, index=False)
+
+    run_pipeline(config_yaml, runtimes_csv, opcounts_json, out_dir, glue=True)
+
+    results = pd.read_csv(out_dir / "results.csv")
+    row = results[results["target_opcode"] == "PROBEOP"].iloc[0]
+    assert float(row["target_coef_runtime_ms"]) == pytest.approx(true_cost, rel=1e-7)
+
+
 def test_baseline_pair_aggregates_repeated_true_trials(tmp_path: Path) -> None:
     """Real benchmark suites repeat each fixture across several trials, so
     the `False` and `True` sides don't line up 1:1 by fixture identity —
@@ -290,3 +292,95 @@ def test_baseline_pair_raises_on_unmatched_false_row(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="no matching overhead_baseline_True"):
         run_pipeline(config_yaml, runtimes_csv, opcounts_json, out_dir, glue=True)
+
+
+def test_native_nonzero_control_counts_are_subtracted_with_explicit_match_key(
+    tmp_path: Path,
+) -> None:
+    """A fixed system tail is removed before the target-count invariant runs."""
+    fixed_tail_adds = 18
+    work_counts = (10, 20, 30, 40, 50, 60, 70, 80)
+    fixtures = [
+        FixtureSpec(
+            test_file="test_native_add",
+            test_name="test_native_add",
+            params={"overhead_baseline": "True", "input_length": "0K"},
+            block_limit_million=1,
+            target_opcode="ADD",
+            target_opcount=fixed_tail_adds,
+        )
+    ]
+    fixtures.extend(
+        FixtureSpec(
+            test_file="test_native_add",
+            test_name="test_native_add",
+            params={
+                "overhead_baseline": "False",
+                "input_length": f"{work_count}K",
+            },
+            block_limit_million=work_count,
+            target_opcode="ADD",
+            target_opcount=fixed_tail_adds + work_count,
+        )
+        for work_count in work_counts
+    )
+    true_cost = 4.0e-5
+    config = base_config(
+        models_custom=[
+            {
+                "test_name": "test_native_add",
+                "target_operation": "ADD",
+                "overhead_baseline_param": "overhead_baseline",
+                "overhead_baseline_match_params": [],
+                "model_params": {"target_coef": "OPCODE_ADD"},
+            }
+        ],
+        clients=("geth",),
+    )
+    config_yaml, runtimes_csv, opcounts_json, out_dir = write_standard_inputs(
+        tmp_path,
+        fixtures=fixtures,
+        models={"geth": ClientModel(intercept=80.0, slope=true_cost)},
+        config=config,
+        noise_pct=0.0,
+    )
+
+    run_pipeline(config_yaml, runtimes_csv, opcounts_json, out_dir)
+
+    results = pd.read_csv(out_dir / "results.csv")
+    row = results[results["target_opcode"] == "ADD"].iloc[0]
+    assert float(row["target_coef_runtime_ms"]) == pytest.approx(true_cost, rel=1e-7)
+
+
+def test_baseline_match_params_require_a_baseline_flag(tmp_path: Path) -> None:
+    """Match-key selection is invalid without an A/B baseline declaration."""
+    fixture = FixtureSpec(
+        test_file="test_native_add",
+        test_name="test_native_add",
+        params={},
+        block_limit_million=1,
+        target_opcode="ADD",
+        target_opcount=1,
+    )
+    config = base_config(
+        models_custom=[
+            {
+                "test_name": "test_native_add",
+                "target_operation": "ADD",
+                "overhead_baseline_match_params": [],
+                "model_params": {"target_coef": "OPCODE_ADD"},
+            }
+        ],
+        clients=("geth",),
+    )
+    config_yaml, _, _, _ = write_standard_inputs(
+        tmp_path,
+        fixtures=[fixture],
+        models={"geth": ClientModel(intercept=80.0, slope=4.0e-5)},
+        config=config,
+    )
+
+    from evm_gasfit import GasFit
+
+    with pytest.raises(ConfigError, match="requires overhead_baseline_param"):
+        GasFit.from_config(config_yaml)

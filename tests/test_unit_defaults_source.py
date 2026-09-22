@@ -3,10 +3,11 @@
 The :mod:`evm_gasfit.defaults` module picks **one** source for the whole run:
 
 - When ``ethereum/execution-specs`` is installed and
-  ``EVM_GASFIT_USE_FALLBACK`` is unset, ``ethereum.<fork>.vm.gas.GasCosts`` is
-  the source of truth. The returned ``GasCosts`` reports
-  ``source == "execution-specs"`` and an ``INFO`` line on the
-  ``evm_gasfit.defaults`` logger names that source.
+  ``EVM_GASFIT_USE_FALLBACK`` is unset, current
+  ``ethereum.forks.<fork>.vm.gas.GasCosts`` or legacy
+  ``ethereum.<fork>.vm.gas.GasCosts`` is the source of truth. The returned
+  ``GasCosts`` reports ``source == "execution-specs"`` and an ``INFO`` line on
+  the ``evm_gasfit.defaults`` logger names that source.
 - When the extra is absent (or the env var is set to ``"1"``), the bundled
   ``_fallback.py`` table is used and ``source == "fallback"``.
 
@@ -59,7 +60,7 @@ def reload_defaults() -> Iterator[None]:
 
 
 def _build_specs_stub(fork: str) -> types.ModuleType:
-    """Build a minimal ``ethereum.<fork>.vm.gas`` stub matching the loader's contract.
+    """Build a minimal ``GasCosts`` module matching the loader's contract.
 
     The loader reads ``module.GasCosts``, iterates ``dir()`` skipping
     underscore names, and collects integer attributes into a flat dict.
@@ -89,6 +90,19 @@ def _install_specs_stub(fork: str) -> None:
         if parent not in sys.modules:
             sys.modules[parent] = types.ModuleType(parent)
     sys.modules[f"ethereum.{fork}.vm.gas"] = _build_specs_stub(fork)
+
+
+def _install_current_specs_stub(fork: str) -> None:
+    """Insert a current ``ethereum.forks.<fork>.vm.gas`` stub."""
+    for parent in (
+        "ethereum",
+        "ethereum.forks",
+        f"ethereum.forks.{fork}",
+        f"ethereum.forks.{fork}.vm",
+    ):
+        if parent not in sys.modules:
+            sys.modules[parent] = types.ModuleType(parent)
+    sys.modules[f"ethereum.forks.{fork}.vm.gas"] = _build_specs_stub(fork)
 
 
 # --------------------------------------------------------------------------
@@ -129,6 +143,22 @@ def test_execution_specs_path_when_extra_installed(
     assert len(matches) == 1, caplog.text
 
 
+def test_current_execution_specs_path_loads_prague(
+    monkeypatch: pytest.MonkeyPatch,
+    reload_defaults: None,
+) -> None:
+    """The current ``ethereum.forks`` package layout serves Prague."""
+    monkeypatch.delenv("EVM_GASFIT_USE_FALLBACK", raising=False)
+    _install_current_specs_stub("prague")
+    importlib.reload(defaults_mod)
+
+    gc = defaults_mod.get_gas_costs("prague")
+
+    assert gc.source == "execution-specs"
+    assert gc.fork == "prague"
+    assert gc[_SENTINEL_OPCODE] == _SENTINEL_SPECS_VALUE
+
+
 # --------------------------------------------------------------------------
 # Fallback path.
 # --------------------------------------------------------------------------
@@ -165,6 +195,29 @@ def test_fallback_path_when_extra_absent(
         and "fork=osaka" in rec.getMessage()
     ]
     assert len(matches) == 1, caplog.text
+
+
+def test_prague_fallback_matches_prague_and_excludes_osaka_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    reload_defaults: None,
+) -> None:
+    """The bundled Prague baseline is not a relabeled Osaka table."""
+    monkeypatch.setenv("EVM_GASFIT_USE_FALLBACK", "1")
+    importlib.reload(defaults_mod)
+
+    prague = defaults_mod.get_gas_costs("prague")
+    osaka = defaults_mod.get_gas_costs("osaka")
+
+    assert prague.source == "fallback"
+    assert prague["BLOB_TARGET_GAS_PER_BLOCK"] == 786432
+    assert prague["BLOB_BASE_FEE_UPDATE_FRACTION"] == 5007716
+    assert prague["REFUND_AUTH_PER_EXISTING_ACCOUNT"] == 12500
+    assert "PRECOMPILE_P256VERIFY" not in prague
+    assert "OPCODE_CLZ" not in prague
+    assert "BLOB_SCHEDULE_TARGET" not in prague
+    assert "BLOCK_ACCESS_LIST_ITEM" not in prague
+    assert osaka["PRECOMPILE_P256VERIFY"] == 6900
+    assert osaka["OPCODE_CLZ"] == 5
 
 
 # --------------------------------------------------------------------------

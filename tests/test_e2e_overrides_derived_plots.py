@@ -40,6 +40,7 @@ def _build_simple_inputs(
     plots: bool,
     overrides: dict | None = None,
     derived: dict | None = None,
+    pricing_scenarios: list[dict] | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     fixtures = []
     for tn, opcode, _gas in _SPECS:
@@ -71,6 +72,8 @@ def _build_simple_inputs(
     )
     if derived is not None:
         config["derived"] = derived
+    if pricing_scenarios is not None:
+        config["pricing_scenarios"] = pricing_scenarios
     return write_standard_inputs(
         tmp_path,
         fixtures=fixtures,
@@ -135,6 +138,45 @@ def test_derived_alias_and_formula_evaluate(tmp_path: Path) -> None:
         (cold_write + cold_access) * 4800 / 5000
     )
     assert rounded("DOUBLED_ACCESS_LIST_ADDRESS") == rounded("ACCESS_LIST_ADDRESS") * 2
+
+
+def test_pricing_scenarios_evaluate_derived_params_in_declaration_order(
+    tmp_path: Path,
+) -> None:
+    """Scenario prices include qualified derived aliases and dependencies."""
+    derived = {
+        "ACCESS_LIST_ADDRESS": "COLD_ACCOUNT_CODE_ACCESS",
+        "DOUBLED_ACCESS_LIST_ADDRESS": {"formula": "ACCESS_LIST_ADDRESS * 2"},
+    }
+    config_yaml, runtimes_csv, opcounts_json, out_dir = _build_simple_inputs(
+        tmp_path,
+        plots=False,
+        derived=derived,
+        pricing_scenarios=[
+            {"name": "conservative", "anchor_rate": 150_000_000, "margin_pct": 10}
+        ],
+    )
+
+    run_pipeline(config_yaml, runtimes_csv, opcounts_json, out_dir)
+
+    scenarios = pd.read_csv(out_dir / "pricing_scenarios.csv")
+    conservative = scenarios[scenarios["scenario"] == "conservative"]
+    assert {
+        "ACCESS_LIST_ADDRESS",
+        "DOUBLED_ACCESS_LIST_ADDRESS",
+    }.issubset(set(conservative["gas_param"]))
+
+    def scenario_price(name: str) -> int:
+        return int(
+            conservative.loc[conservative["gas_param"] == name, "scenario_gas"].iloc[0]
+        )
+
+    assert scenario_price("ACCESS_LIST_ADDRESS") == scenario_price(
+        "COLD_ACCOUNT_CODE_ACCESS"
+    )
+    assert scenario_price("DOUBLED_ACCESS_LIST_ADDRESS") == (
+        scenario_price("ACCESS_LIST_ADDRESS") * 2
+    )
 
 
 @pytest.mark.parametrize("plots", [True, False])
