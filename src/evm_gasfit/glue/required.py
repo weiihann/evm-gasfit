@@ -66,7 +66,8 @@ class GlueOpcodeSpec:
             ``test_arithmetic``/``test_bitwise``/``test_comparison``/
             ``test_memory_access``). ``None`` when ``members`` alone is
             enough.
-        required: ``False`` for specs without a driver fixture (POP, STOP);
+        required: ``False`` for specs without a driver fixture (STOP, which
+            terminates execution and can never appear in a per-count sweep);
             ``validate_inputs`` will not raise on their absence.
     """
 
@@ -83,23 +84,45 @@ _SWAP_MEMBERS: tuple[str, ...] = tuple(f"SWAP{i}" for i in range(1, 17))
 _PUSH_MEMBERS: tuple[str, ...] = tuple(f"PUSH{i}" for i in range(1, 33))
 
 
+# Driver test names follow the calibration exporter's straight-line module
+# (tests/benchmark/compute/calibration/test_glue.py). Pure/cycle drivers use
+# ``*_straight`` names where the target corpus already ships identically
+# named-but-biased workload tests: gasfit slices drivers by ``test_name``
 PRICED_GLUE_SPECS: tuple[GlueOpcodeSpec, ...] = (
-    # Pure glue
-    GlueOpcodeSpec("ISZERO", "pure", "test_iszero", ("ISZERO",)),
-    GlueOpcodeSpec("JUMPDEST", "pure", "test_jumpdests", ("JUMPDEST",)),
-    GlueOpcodeSpec("POP", "pure", None, ("POP",), required=False),
+    # Pure glue — clean straight-line single-opcode sweeps; single-feature
+    # fits are identified because the exporter guarantees no count-correlated
+    # supporting opcodes in these drivers. POP uses a dedicated constant-seed
+    # driver (fixed 512×PUSH0 setup, POP×N with N ≤ 512, no stack cleanup,
+    # witness tail): the constant seed rides the intercept and the POP slope
+    # is identified by its own sweep, so the pure fit anchors POP for every
+    # paired grower driver that subtracts it as a partner.
+    GlueOpcodeSpec("ISZERO", "pure", "test_iszero_straight", ("ISZERO",)),
+    GlueOpcodeSpec("JUMPDEST", "pure", "test_jumpdests_straight", ("JUMPDEST",)),
+    GlueOpcodeSpec(
+        "POP", "pure", "test_pop", ("POP",), test_opcode_filter="POP"
+    ),
     GlueOpcodeSpec("STOP", "pure", None, ("STOP",), required=False),
-    GlueOpcodeSpec("SWAP", "pure", "test_swap", _SWAP_MEMBERS),
-    # Cycle glue
-    GlueOpcodeSpec("CALLDATASIZE", "cycle", "test_calldatasize", ("CALLDATASIZE",)),
-    GlueOpcodeSpec("DUP", "cycle", "test_dup", _DUP_MEMBERS),
-    GlueOpcodeSpec("GAS", "cycle", "test_gas_op", ("GAS",)),
+    GlueOpcodeSpec("SWAP", "pure", "test_swap_straight", _SWAP_MEMBERS),
+    # Cycle glue — jointly fit over the union of their driver rows, with
+    # pure-tier partners (notably POP) subtracted from each driver block's
+    # LHS first and per-driver fixed effects removing setup-level offsets:
+    # coefficients are identified by within-driver count variation only, so
+    # differing fixed setups across drivers can never masquerade as
+    # correlated per-count costs. CALL lives here because its warm-call
+    # driver carries its own sweep; its DUP/POP support is handled by the
+    # joint design and pure anchoring respectively.
+    GlueOpcodeSpec("CALL", "cycle", "test_call_warm", ("CALL",), test_opcode_filter="CALL"),
+    GlueOpcodeSpec(
+        "CALLDATASIZE", "cycle", "test_calldatasize", ("CALLDATASIZE",)
+    ),
+    GlueOpcodeSpec("DUP", "cycle", "test_dup_straight", _DUP_MEMBERS),
+    GlueOpcodeSpec("GAS", "cycle", "test_gas_op_straight", ("GAS",)),
     GlueOpcodeSpec(
         "MLOAD", "cycle", "test_memory_access", ("MLOAD",), test_opcode_filter="MLOAD"
     ),
-    GlueOpcodeSpec("PUSH", "cycle", "test_push", _PUSH_MEMBERS),
+    GlueOpcodeSpec("PUSH", "cycle", "test_push_straight", _PUSH_MEMBERS),
     GlueOpcodeSpec(
-        "PUSH0", "cycle", "test_push", ("PUSH0",), test_opcode_filter="PUSH0"
+        "PUSH0", "cycle", "test_push_straight", ("PUSH0",), test_opcode_filter="PUSH0"
     ),
     GlueOpcodeSpec(
         "STATICCALL",
@@ -209,8 +232,30 @@ def _build_member_to_canonical() -> dict[str, str]:
 # Member opcode mnemonic → canonical family name (e.g. "DUP3" → "DUP").
 MEMBER_TO_CANONICAL: dict[str, str] = _build_member_to_canonical()
 
+# Canonical family name → member mnemonics (e.g. "DUP" → DUP1..DUP16).
+# Singletons map to themselves. Used for group self-exclusion: a target that
+# is itself a family member never has its own family subtracted as glue.
+CANONICAL_TO_MEMBERS: dict[str, tuple[str, ...]] = {
+    spec.name: spec.members for spec in PRICED_GLUE_SPECS
+}
+
 # Canonical-name → spec lookup, used by the mixed-tier fit to find partner specs.
 SPEC_BY_NAME: dict[str, GlueOpcodeSpec] = {s.name: s for s in PRICED_GLUE_SPECS}
+
+# Per-count cost of these glue opcodes depends on an input size, so a
+# coefficient measured on a driver only transfers to a target group with a
+# provably matching size shape. Values are the ``param_``-prefixed fixture
+# columns carrying the size. A partner is shape-verified only when driver
+# and target declare the same single size value; anything else (differing
+# values, sweeping sizes, or one-sided declaration) marks the subtraction
+# unverified and blocks the adjusted recommendation.
+SHAPE_PARAM_BY_SPEC: dict[str, tuple[str, ...]] = {
+    "CALLDATACOPY": ("param_calldata_size", "param_mem_size"),
+    "CALLDATALOAD": ("param_calldata_size",),
+    "MLOAD": ("param_mem_size",),
+    "MSTORE": ("param_mem_size",),
+    "MSTORE8": ("param_mem_size",),
+}
 
 
 def validate_inputs(fixtures_df: pd.DataFrame) -> None:

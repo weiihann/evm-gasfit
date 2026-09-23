@@ -1,14 +1,44 @@
 """Apply the glue adjustment to each fitted target coefficient.
 
-For every ``(test_name, target_opcode, *model_by, client)`` row in
-``results_df``, subtract the contribution of every priced glue opcode that
-correlates with the target on that test group: ratio × glue_runtime_ms. A
-glue opcode's contribution is included only when its per-client fit passed
-both quality gates — ``p_value < p_threshold`` and ``rsquared >= r2_threshold``
-— so a noisy glue fit cannot pull the target coefficient down on the
-strength of a slope it never measured reliably. Negative adjusted
-coefficients are clipped to zero. The point-shifted bounds are retained only
-as an explicitly conditional fallback when full uncertainty cannot propagate.
+For every ``(source_label, test_name, target_opcode, *model_by, client)``
+row in ``results_df``, subtract the contribution of every priced glue
+opcode that correlates with the target on that test group: ratio ×
+glue_runtime_ms. A glue opcode's contribution is included only when its
+per-client fit passed both quality gates — ``p_value < p_threshold`` and
+``rsquared >= r2_threshold`` — **and** the fit is ``isolated`` (every
+count-correlated priced support in its own driver was subtracted), so a
+noisy or bundled glue fit can neither pull the target coefficient down on
+the strength of a slope it never measured reliably nor subtract a
+coefficient that still contains un-attributed partner work. Negative
+adjusted coefficients are clipped to zero. The point-shifted bounds are
+retained only as an explicitly conditional fallback when full uncertainty
+cannot propagate.
+
+Coverage — never silently "isolated"
+------------------------------------
+
+Every detected candidate is classified per row:
+
+- ``glue_priced_opcodes`` — subtracted (gate-passing, isolated, reliable
+  ratio).
+- ``glue_bundled_opcodes`` — not separately priced, but attributed to a
+  subtracted partner via wrapper-bundle accounting: the candidate is
+  count-collinear with a priced partner on this target group, and that
+  partner's calibration driver carries at least as much of the candidate
+  per unit (e.g. STOP 1:1 inside a STOP-only STATICCALL callee), so the
+  partner subtraction already removed it.
+- ``glue_unpriced_opcodes`` — detected, neither subtractable nor covered.
+  Its cost remains inside the target coefficient, so the adjusted estimate
+  is *not* an isolated cost.
+
+``glue_detection_status`` records whether detection ran at all for the
+group (``evaluated`` / ``insufficient_fixture_points`` /
+``ambiguous_target``); ``glue_coverage_complete`` is true only when
+detection ran, every candidate is priced or bundled, and every kept ratio
+was linear-reliable. Rows with incomplete coverage downgrade
+``adjusted_estimate_status`` downstream and are blocked from recommended
+prices — an un-removable correlated supporter must never silently become
+a zero-cost footnote in a deployable price.
 
 Uncertainty propagation
 -----------------------
@@ -23,8 +53,8 @@ cluster identity, missing draw, or failed aligned refit leaves a point-shifted
 interval marked ``glue_interval_conditional = True``; qualification then
 withholds it from recommended pricing.
 
-The detector's per-partner ``ratio`` is held fixed during propagation. Its
-sampling noise is not available in the stored fit matrices.
+The detector's per-partner ``ratio`` (OLS count slope) is held fixed during
+propagation. Its sampling noise is not available in the stored fit matrices.
 """
 
 from __future__ import annotations
@@ -36,19 +66,27 @@ import pandas as pd
 
 from evm_gasfit.modeling.results import NNLSResults
 
+from .required import SHAPE_PARAM_BY_SPEC, SPEC_BY_NAME
+
 _log = logging.getLogger("evm_gasfit.glue")
+
+_BUNDLE_SLACK = 1e-9
 
 
 def _model_by_cols(
     results_df: pd.DataFrame, glue_opcodes_by_test_df: pd.DataFrame
 ) -> list[str]:
     reserved = {
+        "source_label",
         "test_name",
         "client_name",
         "target_opcode",
         "glue_opcode",
         "corr",
         "ratio",
+        "ratio_endpoint_delta",
+        "ratio_reliable",
+        "collinear_with",
     }
     candidates = [c for c in glue_opcodes_by_test_df.columns if c not in reserved]
     return [c for c in candidates if c in results_df.columns]
@@ -134,6 +172,77 @@ def _propagated_interval(
     return low, high, False
 
 
+def _driver_bundle_lookup(
+    driver_support_df: pd.DataFrame | None,
+) -> dict[tuple[str, str], float]:
+    """Map ``(priced driver, support opcode)`` → driver-side per-count ratio."""
+    if driver_support_df is None or driver_support_df.empty:
+        return {}
+    out: dict[tuple[str, str], float] = {}
+    for _, row in driver_support_df.iterrows():
+        support = str(row["support_opcode"])
+        if _candidate_is_priced(support):
+            continue
+        key = (str(row["glue_opcode"]), support)
+        out[key] = float(row["ratio_per_driver_count"])
+    return out
+
+
+def _candidate_is_priced(name: str) -> bool:
+    spec = SPEC_BY_NAME.get(name)
+    return spec is not None and spec.test_name is not None
+
+
+def _glue_row_for(
+    glue_results_df: pd.DataFrame, client: str, name: str
+) -> pd.Series | None:
+    if glue_results_df.empty or "glue_opcode" not in glue_results_df.columns:
+        return None
+    sub = glue_results_df[
+        (glue_results_df["client_name"] == client)
+        & (glue_results_df["glue_opcode"] == name)
+    ]
+    return None if sub.empty else sub.iloc[0]
+
+
+def _shape_verified(name: str, target_row: pd.Series, candidate_row: pd.Series) -> bool:
+    """Return whether an input-dependent glue rate has matching shape evidence."""
+    if name != "CALLDATACOPY":
+        return True
+    shape_columns = SHAPE_PARAM_BY_SPEC.get(name, ())
+    return bool(shape_columns) and all(
+        column in target_row.index
+        and column in candidate_row.index
+        and pd.notna(target_row[column])
+        and pd.notna(candidate_row[column])
+        and str(target_row[column]) == str(candidate_row[column])
+        for column in shape_columns
+    )
+
+
+def _coverage_status(
+    detection_coverage_df: pd.DataFrame | None,
+    source_label: object,
+    test_name: object,
+    target_opcode: object,
+    model_by_values: dict[str, object],
+) -> str:
+    if detection_coverage_df is None or detection_coverage_df.empty:
+        return "evaluated"
+    mask = (
+        (detection_coverage_df["source_label"].astype(str) == str(source_label))
+        & (detection_coverage_df["test_name"].astype(str) == str(test_name))
+        & (detection_coverage_df["target_opcode"].astype(str) == str(target_opcode))
+    )
+    for col, value in model_by_values.items():
+        if col in detection_coverage_df.columns:
+            mask &= detection_coverage_df[col].astype(str) == str(value)
+    sub = detection_coverage_df[mask]
+    if sub.empty:
+        return "evaluated"
+    return str(sub.iloc[0]["detection_status"])
+
+
 def compute_glue_adjustment(
     results_df: pd.DataFrame,
     glue_results_df: pd.DataFrame,
@@ -144,17 +253,23 @@ def compute_glue_adjustment(
     glue_fits: dict[tuple[str, str], NNLSResults] | None = None,
     confidence_level: float = 0.95,
     random_seed: int = 42,
+    detection_coverage_df: pd.DataFrame | None = None,
+    driver_support_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Compute per-row glue adjustment plus the clipped target coefficient.
 
     Returns a DataFrame keyed by ``(source_label, test_name, target_opcode,
     *model_by, client_name)`` with columns ``glue_adjustment``,
     ``adjusted_target_coef_runtime_ms``, ``adjusted_target_coef_conf_int_low``,
-    ``adjusted_target_coef_conf_int_high``, and
-    ``glue_interval_conditional``. ``source_label`` leads the key so two
-    specs that share ``test_name`` + target + ``model_by`` and differ only
-    in ``filter_by`` (e.g. a read/write split) each carry their own
-    adjustment against their own fitted coefficient instead of colliding.
+    ``adjusted_target_coef_conf_int_high``, ``glue_interval_conditional``,
+    plus the coverage ledger: ``glue_priced_opcodes``,
+    ``glue_bundled_opcodes``, ``glue_unpriced_opcodes``,
+    ``glue_coverage_reason``, ``glue_detection_status`` and
+    ``glue_coverage_complete``.
+    ``source_label`` leads the key so two specs that share ``test_name`` +
+    target + ``model_by`` and differ only in ``filter_by`` (e.g. a
+    read/write split) each carry their own adjustment against their own
+    fitted coefficient instead of colliding.
     """
     model_by_cols = _model_by_cols(results_df, glue_opcodes_by_test_df)
     key_cols = [
@@ -166,6 +281,7 @@ def compute_glue_adjustment(
     ]
     rng = np.random.default_rng(random_seed)
     conditional_rows = 0
+    driver_bundles = _driver_bundle_lookup(driver_support_df)
 
     rows: list[dict[str, object]] = []
     for _, row in results_df.iterrows():
@@ -176,8 +292,11 @@ def compute_glue_adjustment(
         # comparing the NaN-filled columns would always be False and zero
         # out `candidates` for every row (`NaN == NaN` is `False`).
         row_model_by_cols = [mb for mb in model_by_cols if pd.notna(row[mb])]
-        ratio_mask = (glue_opcodes_by_test_df["test_name"] == row["test_name"]) & (
-            glue_opcodes_by_test_df["target_opcode"] == row["target_opcode"]
+        model_by_values = {mb: row[mb] for mb in row_model_by_cols}
+        ratio_mask = (
+            (glue_opcodes_by_test_df["test_name"] == row["test_name"])
+            & (glue_opcodes_by_test_df["target_opcode"] == row["target_opcode"])
+            & (glue_opcodes_by_test_df["source_label"] == row["source_label"])
         )
         for mb in row_model_by_cols:
             ratio_mask &= glue_opcodes_by_test_df[mb] == row[mb]
@@ -186,35 +305,120 @@ def compute_glue_adjustment(
         adjustment = 0.0
         # (ratio, partner_fit, partner_name) for every gate-passing partner.
         partners: list[tuple[float, NNLSResults, str]] = []
-        if not candidates.empty and not glue_results_df.empty:
-            glue_for_client = glue_results_df[
-                glue_results_df["client_name"] == row["client_name"]
-            ]
+        priced: list[str] = []
+        unpriced: list[str] = []
+        shape_unverified: set[str] = set()
+        coverage_reasons: list[str] = []
+        # candidate ratio by name, for bundle attribution math.
+        ratios: dict[str, float] = {}
+        collinear_by_name: dict[str, set[str]] = {}
+        if not candidates.empty:
             for _, cand in candidates.iterrows():
-                glue_row_mask = glue_for_client["glue_opcode"] == cand["glue_opcode"]
-                glue_row = glue_for_client[glue_row_mask]
-                if glue_row.empty:
-                    continue
-                pval = float(glue_row.iloc[0]["p_value"])
-                r2 = float(glue_row.iloc[0]["rsquared"])
-                glue_ms = float(glue_row.iloc[0]["glue_runtime_ms"])
-                if (
-                    np.isnan(pval)
-                    or np.isnan(r2)
-                    or np.isnan(glue_ms)
-                    or pval >= p_threshold
-                    or r2 < r2_threshold
-                ):
-                    continue
+                name = str(cand["glue_opcode"])
                 ratio = float(cand["ratio"])
-                adjustment += ratio * glue_ms
+                ratios[name] = ratio
+                collinear_by_name[name] = {
+                    p
+                    for p in str(cand.get("collinear_with") or "").split(";")
+                    if p and p != "nan"
+                }
+                shape_verified = _shape_verified(name, row, cand)
+                reliable = bool(cand.get("ratio_reliable", True))
+                glue_row = _glue_row_for(
+                    glue_results_df, str(row["client_name"]), name
+                )
+                usable = (
+                    shape_verified
+                    and reliable
+                    and _candidate_is_priced(name)
+                    and glue_row is not None
+                    and np.isfinite(float(glue_row["glue_runtime_ms"]))
+                    and np.isfinite(float(glue_row["p_value"]))
+                    and np.isfinite(float(glue_row["rsquared"]))
+                    and float(glue_row["p_value"]) < p_threshold
+                    and float(glue_row["rsquared"]) >= r2_threshold
+                    and (
+                        "isolated" not in glue_row.index
+                        or bool(glue_row["isolated"])
+                    )
+                )
+                if not usable:
+                    unpriced.append(name)
+                    if not shape_verified:
+                        coverage_reasons.append(f"{name}: input shape unverified")
+                        shape_unverified.add(name)
+                    continue
+                adjustment += ratio * float(glue_row["glue_runtime_ms"])
+                priced.append(name)
                 if glue_fits is not None:
                     partner_fit = glue_fits.get(
-                        (row["client_name"], cand["glue_opcode"])
+                        (row["client_name"], name)
                     )
                     if partner_fit is not None:
-                        partners.append((ratio, partner_fit, cand["glue_opcode"]))
+                        partners.append((ratio, partner_fit, name))
 
+        # Wrapper-bundle attribution is exact aggregate accounting. Every
+        # priced partner is checked, so an embedded STOP absent from the
+        # target is an explicit zero-vs-positive mismatch.
+        bundled: list[str] = []
+        still_unpriced = list(unpriced)
+        target_unpriced = {
+            name
+            for name in unpriced
+            if name not in shape_unverified and not _candidate_is_priced(name)
+        }
+        aggregate: dict[str, float] = {}
+        for partner in priced:
+            partner_ratio = ratios.get(partner, 0.0)
+            if partner_ratio <= 0:
+                continue
+            for (driver, support), driver_ratio in driver_bundles.items():
+                if driver != partner or _candidate_is_priced(support):
+                    continue
+                aggregate[support] = (
+                    aggregate.get(support, 0.0) + partner_ratio * driver_ratio
+                )
+        mismatches = {
+            support
+            for support in set(target_unpriced) | set(aggregate)
+            if abs(
+                aggregate.get(support, 0.0)
+                - (ratios.get(support, 0.0) if support in target_unpriced else 0.0)
+            )
+            > _BUNDLE_SLACK
+        }
+        if not mismatches and target_unpriced:
+            bundled = sorted(target_unpriced)
+            still_unpriced = [
+                name for name in still_unpriced if name not in target_unpriced
+            ]
+        elif mismatches:
+            coverage_reasons.append(
+                "bundle composition mismatch: "
+                + ", ".join(sorted(mismatches))
+            )
+            still_unpriced = sorted(set(still_unpriced) | mismatches)
+        unpriced = sorted(still_unpriced)
+
+        detection_status = _coverage_status(
+            detection_coverage_df,
+            row["source_label"],
+            row["test_name"],
+            row["target_opcode"],
+            model_by_values,
+        )
+        unreliable = [
+            str(cand["glue_opcode"])
+            for _, cand in candidates.iterrows()
+            if not bool(cand.get("ratio_reliable", True))
+        ]
+        coverage_complete = (
+            detection_status == "evaluated"
+            and not unpriced
+            and not unreliable
+            and not mismatches
+            and not coverage_reasons
+        )
         target = float(row["target_coef_runtime_ms"])
         low = float(row["target_coef_conf_int_low"])
         high = float(row["target_coef_conf_int_high"])
@@ -267,6 +471,12 @@ def compute_glue_adjustment(
                 "adjusted_target_coef_conf_int_low": adjusted_low,
                 "adjusted_target_coef_conf_int_high": adjusted_high,
                 "glue_interval_conditional": conditional,
+                "glue_priced_opcodes": ";".join(sorted(priced)),
+                "glue_bundled_opcodes": ";".join(sorted(bundled)),
+                "glue_unpriced_opcodes": ";".join(sorted(unpriced)),
+                "glue_coverage_reason": "; ".join(sorted(set(coverage_reasons))),
+                "glue_detection_status": detection_status,
+                "glue_coverage_complete": coverage_complete,
             }
         )
         rows.append(out_row)
@@ -277,6 +487,16 @@ def compute_glue_adjustment(
             "on point glue estimates — supporting-cost uncertainty was not "
             "propagated",
             conditional_rows,
+        )
+    incomplete = sum(
+        1 for r in rows if not bool(r.get("glue_coverage_complete", True))
+    )
+    if incomplete:
+        _log.warning(
+            "glue-coverage: %d adjusted estimate(s) have incomplete supporting-"
+            "cost coverage (unpriced or unreliable detected supporters, or "
+            "detection could not run); isolated recommendations are blocked",
+            incomplete,
         )
 
     out = pd.DataFrame(rows)

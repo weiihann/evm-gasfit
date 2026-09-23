@@ -328,18 +328,114 @@ def evaluate_qualification(config: Config, planned: list[PlannedFit]) -> pd.Data
     ).reset_index(drop=True)
 
 
+def adjusted_interval_reasons(
+    config: Config,
+    glue_adjustment_df: pd.DataFrame | None,
+    planned: list[PlannedFit],
+) -> dict[tuple, list[str]]:
+    """Gate the *adjusted* estimate on its propagated interval.
+
+    The raw-status relative-CI gate inspects the unadjusted point and
+    interval; a small subtraction can leave an adjusted interval that
+    spans zero or whose relative width balloons far past the configured
+    tolerance while the raw row stays qualified. The adjusted estimate is
+    what feeds an isolated recommendation, so it gets its own check:
+    finite bounds, a strictly positive point and upper bound, and — when
+    ``max_relative_uncertainty`` is armed — the same relative-width bound
+    computed on the adjusted interval. Raw ``status`` is never touched.
+    """
+    if glue_adjustment_df is None or glue_adjustment_df.empty:
+        return {}
+    q = config.qualification
+    max_rel = q.max_relative_uncertainty
+    confidence = q.confidence_level
+    by_key: dict[tuple, dict[str, object]] = {}
+    model_by_cols = sorted(
+        c for c in glue_adjustment_df.columns if c.startswith("param_")
+    )
+    for _, row in glue_adjustment_df.iterrows():
+        if bool(row.get("glue_interval_conditional", False)):
+            continue  # conditional intervals are downgraded elsewhere
+        key = (
+            str(row["source_label"]),
+            str(row["test_name"]),
+            str(row["target_opcode"]),
+            *[str(row[mb]) for mb in model_by_cols if pd.notna(row[mb])],
+            str(row["client_name"]),
+        )
+        by_key[key] = row
+    out: dict[tuple, list[str]] = {}
+    for record in planned:
+        key = fit_key(
+            record.source_label,
+            record.test_name,
+            record.target_opcode,
+            record.group_values,
+            record.client,
+        )
+        row = by_key.get(key)
+        if row is None:
+            continue
+        reasons: list[str] = []
+        point = float(row["adjusted_target_coef_runtime_ms"])
+        low = float(row["adjusted_target_coef_conf_int_low"])
+        high = float(row["adjusted_target_coef_conf_int_high"])
+        if not (np.isfinite(point) and np.isfinite(low) and np.isfinite(high)):
+            reasons.append(
+                "adjusted estimate interval is not finite after glue subtraction"
+            )
+        else:
+            if low > high or point < low or point > high:
+                reasons.append(
+                    f"adjusted interval [{low:.3g}, {high:.3g}] does not "
+                    f"contain point estimate {point:.3g} in ordered bounds"
+                )
+            if point <= 0:
+                reasons.append(
+                    f"adjusted point estimate {point:.3g} is not positive after "
+                    "glue subtraction"
+                )
+            if low < 0 or high <= 0:
+                reasons.append(
+                    f"adjusted interval [{low:.3g}, {high:.3g}] cannot support a "
+                    "positive isolated price (lower bound negative or upper "
+                    "bound non-positive)"
+                )
+            if max_rel is not None and point > 0:
+                width = (high - low) / point
+                if not np.isfinite(width):
+                    reasons.append(
+                        "adjusted relative CI width is not computable while an "
+                        "uncertainty gate is armed"
+                    )
+                elif width > max_rel:
+                    reasons.append(
+                        f"adjusted relative CI width {width:.3f} exceeds "
+                        f"{max_rel:.3g} at confidence {confidence:.2f}"
+                    )
+        if reasons:
+            out[key] = reasons
+    return out
+
+
 def apply_adjusted_statuses(
     qualification_df: pd.DataFrame,
-    conditional_keys: set[tuple],
+    downgrades: dict[tuple, list[str]],
     planned: list[PlannedFit],
 ) -> pd.DataFrame:
-    """Downgrade adjusted estimates whose supporting uncertainty is unavailable.
+    """Downgrade adjusted estimates whose supporting evidence is unusable.
 
-    A point-shifted interval omits uncertainty from an included glue estimate.
-    It is never eligible to support a recommended price, regardless of whether
-    an optional CI-width gate was configured for the primary model.
+    ``downgrades`` maps the canonical ``fit_key`` to reason strings: a
+    point-shifted (conditional) interval, incomplete supporting-cost
+    coverage, or an adjusted interval that fails the propagated-interval
+    gate. Each downgrades ``adjusted_estimate_status`` to inconclusive with
+    the explicit reasons appended; ``status`` (the raw timing-model
+    verdict) is preserved so budget-style consumers can still use the raw
+    qualified estimate. A point-shifted interval or unresolved coverage
+    disqualifies the row from recommended pricing regardless of any
+    optional CI-width gate.
     """
-    if qualification_df.empty or not conditional_keys:
+    if qualification_df.empty or not downgrades:
         return qualification_df
     out = qualification_df.copy()
     for record in planned:
@@ -350,7 +446,8 @@ def apply_adjusted_statuses(
             record.group_values,
             record.client,
         )
-        if key not in conditional_keys:
+        reasons = downgrades.get(key)
+        if not reasons:
             continue
         mask = (
             (out["source_label"] == record.source_label)
@@ -372,12 +469,10 @@ def apply_adjusted_statuses(
             out.loc[mask, "adjusted_estimate_status"] = STATUS_INCONCLUSIVE
             prev = out.loc[mask, "reasons"].astype(str)
             out.loc[mask, "reasons"] = prev.map(
-                lambda r: (
-                    r
-                    if "conditional" in r
-                    else (r + "; " if r else "")
-                    + "adjusted interval conditional on point glue estimate "
-                    "(uncertainty not propagated)"
+                lambda r: r + "".join(
+                    f"; {reason}" if reason not in r else "" for reason in reasons
                 )
+                if r
+                else "; ".join(reasons)
             )
     return out

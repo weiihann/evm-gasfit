@@ -737,11 +737,12 @@ PRESETS: dict[str, ModelSpec] = {
         target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000006",
         # The add-family covers four EEST variants (`bn128_add`,
         # `bn128_add_negative`, `bn128_add_infinities`, `bn128_double`); the
-        # `!bn128_mul` negation excludes the mul-family which shares the
-        # `test_alt_bn128` test_name. The `bn128` fixture-param (parsed from
-        # the variant token) carries the variant label so NNLS fits one
-        # model per variant.
-        filter_by=["bn128_", "!bn128_mul"],
+        # selectors must not reach the mul-family or the pairing variants
+        # (`bn128_one_pairing`, `bn128_two_pairings`) that share the
+        # `test_alt_bn128` test_name — a bare `bn128_` prefix matches them.
+        # The `bn128` fixture-param (parsed from the variant token) carries
+        # the variant label so NNLS fits one model per variant.
+        filter_by=["bn128_add", "bn128_double"],
         model_by=["bn128"],
         model_params={"target_coef": "PRECOMPILE_ECADD"},
     ),
@@ -805,14 +806,15 @@ PRESETS: dict[str, ModelSpec] = {
     "precompile_bls_fp_to_g1": ModelSpec(
         test_name="test_bls12_381",
         target_operation="BLS12_MAP_FP_TO_G1",
-        target_operation_count_source="PRECOMPILE_0x000000000000000000000000000000000000000f",
+        # EIP-2537 assigns the G1/G2 maps to addresses 0x10 and 0x11.
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000010",
         filter_by=["bls12_fp_to_g1"],
         model_params={"target_coef": "PRECOMPILE_BLS_G1MAP"},
     ),
     "precompile_bls_fp_to_g2": ModelSpec(
         test_name="test_bls12_381",
-        target_operation="BLS12_MAP_FP_TO_G2",
-        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000010",
+        target_operation="BLS12_MAP_FP2_TO_G2",
+        target_operation_count_source="PRECOMPILE_0x0000000000000000000000000000000000000011",
         filter_by=["bls12_fp_to_g2"],
         model_params={"target_coef": "PRECOMPILE_BLS_G2MAP"},
     ),

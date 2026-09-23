@@ -529,6 +529,22 @@ def estimate_models(config: Config, fixtures_df: pd.DataFrame) -> EstimateOutput
     fits: dict[tuple, NNLSResults] = {}
     planned: list[PlannedFit] = []
     unmatched: list[ModelSpec] = []
+    # Calibration-lane rows (param_campaign_role=calibration) are glue-driver
+    # evidence, never target-model input: an overly broad spec selector must
+    # not absorb a straight-line driver sweep into a priced target fit. The
+    # glue estimator consumes the unfiltered frame.
+    # Local import: evm_gasfit.glue's __init__ pulls this module back in
+    # (via glue.detect), so a module-level import would be circular.
+    from evm_gasfit.glue.lane import split_campaign_lanes
+
+    fixtures_df, calibration_df = split_campaign_lanes(fixtures_df)
+    if not calibration_df.empty:
+        _log.warning(
+            "campaign-lanes: %d calibration row(s) excluded from every target "
+            "model fit (glue drivers only); target rows: %d",
+            len(calibration_df),
+            len(fixtures_df),
+        )
     session_column = config.campaign.session_column
     if session_column not in fixtures_df.columns:
         # Legacy three-column CSVs carry no session metadata; pairing and

@@ -96,10 +96,9 @@ def build_proposal(
             for record in planned:
                 if record.fit is None:
                     continue
-                spec = specs_by_label.get(record.source_label)
-                order = (
-                    spec.model_by if spec is not None else sorted(record.group_values)
-                )
+                # Key order follows the canonical sorted(group_values) —
+                # the same convention the adjuster and qualification use.
+                order = sorted(record.group_values)
                 target_fits[
                     (
                         record.source_label,
@@ -123,6 +122,8 @@ def build_proposal(
             glue_fits=glue_estimate_output.fits,
             confidence_level=config.qualification.confidence_level,
             random_seed=config.modeling.random_seed,
+            detection_coverage_df=glue_estimate_output.detection_coverage_df,
+            driver_support_df=glue_estimate_output.driver_support_df,
         )
         missing_glue_pairs = detect_missing_glue(
             fixtures_df,
@@ -138,21 +139,23 @@ def build_proposal(
             _log.warning(msg)
             warnings_list.append(msg)
 
-    # Downgrade adjusted-estimate statuses where the interval stayed
-    # conditional (point glue estimate only).
+    # Downgrade adjusted-estimate statuses: point-shifted (conditional)
+    # intervals, incomplete supporting-cost coverage, and adjusted intervals
+    # that fail the propagated-interval gate. All three make the adjusted
+    # estimate unusable as an isolated recommended price; none touches the
+    # raw timing-model status.
     if (
         glue_adjustment_df is not None
         and qualification_df is not None
         and planned is not None
         and not glue_adjustment_df.empty
-        and "glue_interval_conditional" in glue_adjustment_df.columns
     ):
-        from evm_gasfit.modeling.qualification import apply_adjusted_statuses
+        from evm_gasfit.modeling.qualification import (
+            adjusted_interval_reasons,
+            apply_adjusted_statuses,
+        )
 
-        conditional_keys: set[tuple] = set()
-        for _, row in glue_adjustment_df.iterrows():
-            if not bool(row["glue_interval_conditional"]):
-                continue
+        def _row_key(row: pd.Series) -> tuple | None:
             spec = next(
                 (
                     candidate
@@ -162,21 +165,60 @@ def build_proposal(
                 None,
             )
             if spec is None:
-                continue
-            conditional_keys.add(
-                (
-                    str(row["source_label"]),
-                    str(row["test_name"]),
-                    str(row["target_opcode"]),
-                    *[str(row[c]) for c in sorted(spec.model_by)],
-                    str(row["client_name"]),
-                )
+                return None
+            model_by = [
+                c
+                for c in sorted(spec.model_by)
+                if c in glue_adjustment_df.columns and pd.notna(row[c])
+            ]
+            return (
+                str(row["source_label"]),
+                str(row["test_name"]),
+                str(row["target_opcode"]),
+                *[str(row[c]) for c in model_by],
+                str(row["client_name"]),
             )
-        qualification_df = apply_adjusted_statuses(
-            qualification_df,
-            conditional_keys,
-            planned,
-        )
+
+        downgrades: dict[tuple, list[str]] = {}
+        for _, row in glue_adjustment_df.iterrows():
+            key = _row_key(row)
+            if key is None:
+                continue
+            reasons: list[str] = []
+            if bool(row.get("glue_interval_conditional", False)):
+                reasons.append(
+                    "adjusted interval conditional on point glue estimate "
+                    "(uncertainty not propagated)"
+                )
+            unpriced = str(row.get("glue_unpriced_opcodes") or "")
+            if unpriced:
+                reasons.append(
+                    f"detected supporting opcode(s) not isolable: {unpriced}"
+                )
+            coverage_reason = str(row.get("glue_coverage_reason") or "")
+            coverage_value = row.get("glue_coverage_complete", True)
+            coverage_incomplete = str(coverage_value).strip().lower() in {
+                "false",
+                "0",
+            }
+            if coverage_incomplete:
+                detail = coverage_reason or "supporting-cost coverage is incomplete"
+                reasons.append(f"glue coverage incomplete: {detail}")
+            status = str(row.get("glue_detection_status") or "evaluated")
+            if status != "evaluated":
+                reasons.append(
+                    f"support-cost detection could not run ({status})"
+                )
+            if reasons:
+                downgrades.setdefault(key, []).extend(reasons)
+        for key, reasons in adjusted_interval_reasons(
+            config, glue_adjustment_df, planned
+        ).items():
+            downgrades.setdefault(key, []).extend(reasons)
+        if downgrades:
+            qualification_df = apply_adjusted_statuses(
+                qualification_df, downgrades, planned
+            )
 
     expanded_df = expand_to_per_client(
         results_df, config, glue_adjustment_df, qualification_df
@@ -225,6 +267,12 @@ def build_proposal(
             "feature_kind",
             "glue_adjustment",
             "glue_interval_conditional",
+            "glue_priced_opcodes",
+            "glue_bundled_opcodes",
+            "glue_unpriced_opcodes",
+            "glue_coverage_reason",
+            "glue_detection_status",
+            "glue_coverage_complete",
             "qualification_status",
             "rsquared",
             "rsquared_adj",
@@ -234,15 +282,17 @@ def build_proposal(
             "is_winner",
         }
     ]
-
-    # Placeholder rows for proposed names with no successful fit.
-    expected_params: set[str] = {
-        v
+    declared_params = [
+        gas_param
         for spec in config.resolved_models
-        for v in [*spec.model_params.values(), *spec.setup_params.values()]
-    }
-    fitted_params: set[str] = set(new_gas_df["gas_param"].astype(str))
-    missing_params = sorted(expected_params - fitted_params)
+        for gas_param in [*spec.model_params.values(), *spec.setup_params.values()]
+    ]
+    declared_params.extend(config.new_params)
+    missing_params = [
+        name
+        for name in dict.fromkeys(declared_params)
+        if name not in set(new_gas_all_df.get("gas_param", pd.Series(dtype=str)))
+    ]
     for name in missing_params:
         new_gas_df = pd.concat(
             [

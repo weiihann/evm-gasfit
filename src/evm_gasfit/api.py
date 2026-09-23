@@ -373,6 +373,18 @@ class GasFit:
                 index=False,
                 lineterminator="\n",
             )
+            if not self.glue_estimate_output.detection_coverage_df.empty:
+                self.glue_estimate_output.detection_coverage_df.to_csv(
+                    out_dir / "glue_detection_coverage.csv",
+                    index=False,
+                    lineterminator="\n",
+                )
+            if not self.glue_estimate_output.driver_support_df.empty:
+                self.glue_estimate_output.driver_support_df.to_csv(
+                    out_dir / "glue_driver_support.csv",
+                    index=False,
+                    lineterminator="\n",
+                )
 
         write_runtime_report(
             out_dir,

@@ -58,6 +58,11 @@ class FixtureSpec:
     # Template for the trailing scan-axis token; `{n}` is replaced with
     # `block_limit_million`. EEST's newer convention is `"benchmark_{n}M"`.
     sweep_token_format: str = "block_limit_million_{n}"
+    # Campaign lane (``param_campaign_role``): calibration rows are glue
+    # drivers excluded from every target-model fit; target/None rows are
+    # the priced corpus. Emitted as an explicit CSV column when any
+    # fixture carries a role.
+    campaign_role: str | None = None
 
     @property
     def fixture_name(self) -> str:
@@ -133,19 +138,23 @@ def write_runtimes_csv(
 ) -> None:
     """Write a runtimes CSV with one row per (client, fixture).
 
-    Uses pandas so the schema (header order, types) is predictable.
+    Uses pandas so the schema (header order, types) is predictable. When any
+    fixture carries a ``campaign_role``, a ``param_campaign_role`` column is
+    emitted for every row (target rows are explicit).
     """
     rng = np.random.default_rng(seed)
+    has_roles = any(f.campaign_role is not None for f in fixtures)
     rows = []
     for client, model in models.items():
         for spec in fixtures:
-            rows.append(
-                {
-                    "client_name": client,
-                    "fixture_name": spec.fixture_name,
-                    "test_runtime_ms": runtime_for(spec, model, rng, noise_pct),
-                }
-            )
+            row = {
+                "client_name": client,
+                "fixture_name": spec.fixture_name,
+                "test_runtime_ms": runtime_for(spec, model, rng, noise_pct),
+            }
+            if has_roles:
+                row["param_campaign_role"] = spec.campaign_role or "target"
+            rows.append(row)
     pd.DataFrame(rows).to_csv(path, index=False)
 
 
@@ -195,6 +204,7 @@ def make_block_limit_fixtures(
     target_opcount_per_million: float = 1_000_000.0,
     extra_opcount_per_million: Mapping[str, float] | None = None,
     sweep_token_format: str = "block_limit_million_{n}",
+    campaign_role: str | None = None,
 ) -> list[FixtureSpec]:
     """Build fixtures that vary only by block-limit.
 
@@ -218,6 +228,7 @@ def make_block_limit_fixtures(
                     op: bl * per_m for op, per_m in extra_opcount_per_million.items()
                 },
                 sweep_token_format=sweep_token_format,
+                campaign_role=campaign_role,
             )
         )
     return fixtures
@@ -270,6 +281,7 @@ def cross_product_fixtures(
 def make_glue_driver_fixtures(
     target_opcount_per_million: float = 2_000_000.0,
     sweep_token_format: str = "block_limit_million_{n}",
+    campaign_role: str | None = "calibration",
 ) -> list[FixtureSpec]:
     """Driver fixtures for every pure or cycle priced glue spec.
 
@@ -277,8 +289,8 @@ def make_glue_driver_fixtures(
     block-limit sweep per family member of the **pure** and **cycle**
     tiers. Family specs (DUP/SWAP/PUSH) therefore produce one sweep per
     `DUPn`/`SWAPn`/`PUSHn`; the e2e pipeline collapses them into one
-    canonical estimate. Specs without a driver test (POP, STOP) are
-    skipped.
+    canonical estimate. Specs without a driver test are skipped. Fixtures
+    default to the calibration lane, mirroring the real campaign layout.
 
     Mixed-tier specs (`mixed_a`, `mixed_b`) are intentionally excluded:
     their canonical names (`ADD`, `MSTORE`, `KECCAK256`, ...) are also
@@ -304,6 +316,7 @@ def make_glue_driver_fixtures(
                     params={"opcode": member},
                     target_opcount_per_million=target_opcount_per_million,
                     sweep_token_format=sweep_token_format,
+                    campaign_role=campaign_role,
                 )
             )
     return fixtures

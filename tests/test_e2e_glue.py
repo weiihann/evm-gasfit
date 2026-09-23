@@ -328,6 +328,7 @@ def test_mixed_glue_partner_draws_reach_adjusted_target_interval() -> None:
     )
     mixed_slice = pd.DataFrame(
         {
+            "fixture_name": [f"fixture_{i}" for i in range(len(groups))],
             "client_name": "geth",
             "test_name": "test_memory_access",
             "param_opcode": "MSTORE",
@@ -337,6 +338,7 @@ def test_mixed_glue_partner_draws_reach_adjusted_target_interval() -> None:
             "session_id": groups,
         }
     )
+    mixed_slice.attrs["opcode_columns"] = ["MSTORE", "ISZERO"]
     config = SimpleNamespace(
         modeling=SimpleNamespace(
             bootstrap_iterations=n_bootstrap,
@@ -344,26 +346,19 @@ def test_mixed_glue_partner_draws_reach_adjusted_target_interval() -> None:
         ),
         campaign=SimpleNamespace(session_column="session_id"),
     )
-    mstore_fit = _mixed_fit(
+    mstore_fit, unsubscribed = _mixed_fit(
         mixed_slice,
         config,
         "geth",
         SPEC_BY_NAME["MSTORE"],
         {("geth", "ISZERO"): iszero_fit},
-        pd.DataFrame(
-            [
-                {
-                    "test_name": "test_memory_access",
-                    "target_opcode": "MSTORE",
-                    "glue_opcode": "ISZERO",
-                }
-            ]
-        ),
         frozenset({"pure"}),
         p_threshold=0.05,
         r2_threshold=0.5,
+        eps=0.05,
     )
     assert mstore_fit is not None
+    assert unsubscribed == []
 
     target_fit = NNLSResults(
         X=np.column_stack([np.ones(4), mstore_counts]),
@@ -399,12 +394,14 @@ def test_mixed_glue_partner_draws_reach_adjusted_target_interval() -> None:
                     "glue_runtime_ms": 5.0,
                     "p_value": 0.01,
                     "rsquared": 1.0,
+                    "isolated": True,
                 }
             ]
         ),
         pd.DataFrame(
             [
                 {
+                    "source_label": "keccak",
                     "test_name": "test_keccak",
                     "target_opcode": "KECCAK256",
                     "glue_opcode": "MSTORE",
@@ -421,6 +418,7 @@ def test_mixed_glue_partner_draws_reach_adjusted_target_interval() -> None:
     ).iloc[0]
 
     assert not bool(adjusted["glue_interval_conditional"])
+    assert bool(adjusted["glue_coverage_complete"])
     assert float(adjusted["adjusted_target_coef_conf_int_low"]) == pytest.approx(2.0)
     assert float(adjusted["adjusted_target_coef_conf_int_high"]) == pytest.approx(8.0)
 
@@ -628,11 +626,11 @@ def test_glue_mixed_a_does_not_subtract_other_mixed_a_partners(
 def test_glue_missing_optional_driver_does_not_raise(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """POP/STOP have no driver fixtures in any current dataset.
+    """STOP has no driver fixture in any dataset (it halts execution).
 
-    The pipeline must still run; the spec rows just don't appear in
-    `glue_results.csv`. (No new warning is needed for the always-missing
-    POP/STOP case — see the validate_inputs policy.)
+    POP gained a straight-line calibration driver and is now required; only
+    STOP remains optional. The pipeline must still run; the spec row just
+    doesn't appear in `glue_results.csv`.
     """
     all_fixtures = _main_fixtures() + make_glue_driver_fixtures()
     models = {"geth": ClientModel(intercept=50.0, slope=2.0e-5)}
@@ -648,7 +646,8 @@ def test_glue_missing_optional_driver_does_not_raise(
         run_pipeline(config_yaml, runtimes_csv, opcounts_json, out_dir, glue=True)
 
     glue_results = pd.read_csv(out_dir / "glue_results.csv")
-    assert "POP" not in set(glue_results["glue_opcode"])
+    # POP now carries a real driver row; STOP can never have one.
+    assert "POP" in set(glue_results["glue_opcode"])
     assert "STOP" not in set(glue_results["glue_opcode"])
 
 
