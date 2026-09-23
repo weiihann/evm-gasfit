@@ -241,7 +241,7 @@ def test_poor_fit_glue_opcodes_surface_under_missing_glue_section(
     }
     # Heavy noise on beta's ISZERO driver alone — every other (test, client)
     # combo stays clean, so only the ISZERO/beta glue fit fails R².
-    noise_table = {("test_iszero", "beta"): 0.6}
+    noise_table = {("test_iszero_straight", "beta"): 0.6}
 
     config_yaml = tmp_path / "config.yaml"
     runtimes_csv = tmp_path / "runtimes.csv"

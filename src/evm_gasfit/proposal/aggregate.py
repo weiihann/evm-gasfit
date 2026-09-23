@@ -28,11 +28,27 @@ def _lookup_glue_adjustment(
     model_by: list[str],
     model_by_values: dict[str, object],
     client: str,
-) -> tuple[float, float | None, float | None, float | None, bool]:
-    """Return (adjustment, adjusted_runtime, adjusted_low, adjusted_high,
-    interval_conditional) or zeros."""
+) -> tuple[float, float | None, float | None, float | None, bool, dict[str, object]]:
+    """Return ``(adjustment, adjusted_runtime, adjusted_low, adjusted_high,
+    interval_conditional, coverage)`` or zeros.
+
+    ``coverage`` carries the per-row supporting-cost ledger
+    (``glue_priced_opcodes`` / ``glue_bundled_opcodes`` /
+    ``glue_unpriced_opcodes`` / ``glue_coverage_reason`` /
+    ``glue_detection_status`` / ``glue_coverage_complete``) so recommendation
+    consumers can see which supporters were subtracted, which were bundled
+    into a priced partner, and which blocked isolation.
+    """
+    empty_coverage = {
+        "glue_priced_opcodes": "",
+        "glue_bundled_opcodes": "",
+        "glue_unpriced_opcodes": "",
+        "glue_coverage_reason": "",
+        "glue_detection_status": "evaluated",
+        "glue_coverage_complete": True,
+    }
     if glue_adjustment_df is None or glue_adjustment_df.empty:
-        return 0.0, None, None, None, False
+        return 0.0, None, None, None, False, empty_coverage
     mask = (
         (glue_adjustment_df["test_name"] == test_name)
         & (glue_adjustment_df["target_opcode"] == target_opcode)
@@ -48,7 +64,7 @@ def _lookup_glue_adjustment(
             mask &= glue_adjustment_df[col] == model_by_values[col]
     sub = glue_adjustment_df[mask]
     if sub.empty:
-        return 0.0, None, None, None, False
+        return 0.0, None, None, None, False, empty_coverage
     row = sub.iloc[0]
     conditional = (
         bool(row["glue_interval_conditional"])
@@ -56,12 +72,21 @@ def _lookup_glue_adjustment(
         and pd.notna(row.get("glue_interval_conditional"))
         else False
     )
+    coverage = {
+        "glue_priced_opcodes": str(row.get("glue_priced_opcodes") or ""),
+        "glue_bundled_opcodes": str(row.get("glue_bundled_opcodes") or ""),
+        "glue_unpriced_opcodes": str(row.get("glue_unpriced_opcodes") or ""),
+        "glue_coverage_reason": str(row.get("glue_coverage_reason") or ""),
+        "glue_detection_status": str(row.get("glue_detection_status") or "evaluated"),
+        "glue_coverage_complete": bool(row.get("glue_coverage_complete", True)),
+    }
     return (
         float(row["glue_adjustment"]),
         float(row["adjusted_target_coef_runtime_ms"]),
         float(row["adjusted_target_coef_conf_int_low"]),
         float(row["adjusted_target_coef_conf_int_high"]),
         conditional,
+        coverage,
     )
 
 
@@ -127,14 +152,16 @@ def expand_to_per_client(
             *[str(model_by_values[c]) for c in sorted(spec.model_by)],
             str(client),
         )
-        slope_status, adjusted_status = qual.get(qual_key, ("", ""))
-
+        slope_status, adjusted_status = qual.get(
+            qual_key, (str(res_row.get("qualification_status", "")), "")
+        )
         (
             glue_adjustment,
             adj_runtime,
             adj_low,
             adj_high,
             interval_conditional,
+            glue_coverage,
         ) = _lookup_glue_adjustment(
             glue_adjustment_df,
             spec.source_label,
@@ -164,6 +191,7 @@ def expand_to_per_client(
                         pvalue = float(res_row["target_coef_pvalue"])
                         row_glue_adjustment = float(glue_adjustment)
                         row_status = adjusted_status or slope_status
+                        row_glue_coverage = glue_coverage
                     else:
                         rt_col = f"{coef_name}_runtime_ms"
                         if rt_col not in res_row.index:
@@ -177,6 +205,14 @@ def expand_to_per_client(
                         ci_high = float(res_row[f"{coef_name}_conf_int_high"])
                         row_glue_adjustment = 0.0
                         row_status = slope_status
+                        row_glue_coverage = {
+                            "glue_priced_opcodes": "",
+                            "glue_bundled_opcodes": "",
+                            "glue_unpriced_opcodes": "",
+                            "glue_coverage_reason": "",
+                            "glue_detection_status": "evaluated",
+                            "glue_coverage_complete": True,
+                        }
                 else:
                     rt_col = f"{coef_name}_runtime_ms"
                     if rt_col not in res_row.index:
@@ -190,6 +226,14 @@ def expand_to_per_client(
                     ci_high = float(res_row[f"{coef_name}_conf_int_high"])
                     row_glue_adjustment = 0.0
                     row_status = slope_status
+                    row_glue_coverage = {
+                        "glue_priced_opcodes": "",
+                        "glue_bundled_opcodes": "",
+                        "glue_unpriced_opcodes": "",
+                        "glue_coverage_reason": "",
+                        "glue_detection_status": "evaluated",
+                        "glue_coverage_complete": True,
+                    }
 
                 if anchor_rate is not None:
                     new_gas_decimal = float(anchor_rate) * runtime_ms / 1000.0
@@ -216,6 +260,7 @@ def expand_to_per_client(
                     "rsquared": float(res_row["rsquared"]),
                     "rsquared_adj": float(res_row["rsquared_adj"]),
                 }
+                out.update(row_glue_coverage)
                 for col in model_by_cols:
                     if col in spec.model_by:
                         out[col] = model_by_values[col]
@@ -242,6 +287,12 @@ def expand_to_per_client(
             "feature_kind",
             "glue_adjustment",
             "glue_interval_conditional",
+            "glue_coverage_complete",
+            "glue_priced_opcodes",
+            "glue_bundled_opcodes",
+            "glue_unpriced_opcodes",
+            "glue_coverage_reason",
+            "glue_detection_status",
             "qualification_status",
             "rsquared",
             "rsquared_adj",
