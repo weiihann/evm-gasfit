@@ -11,7 +11,7 @@ CLI
 ::
 
     python -m evm_gasfit.recommendations create-config \\
-        --workload WORKLOAD.json --out analysis-gasfit.yaml \\
+        --workload WORKLOAD.json --client evm2 --out analysis-gasfit.yaml \\
         [--anchor-rate 600000000] [--min-sessions 4]
 
     python -m evm_gasfit.recommendations build \\
@@ -98,7 +98,10 @@ ALLOWED_FAMILIES = frozenset(
         "precompile",
     }
 )
-OPCOUNT_TOKEN_RE = re.compile(r"-opcount_[^\]]+")
+# Terminal work-size token of an exported case id: fixed-count exports end in
+# ``-opcount_<n>K``, gas-budget (EIP-7904 layout) exports in
+# ``-benchmark-gas-value_<n>M``. Stripping it yields the variant identity.
+COUNT_TOKEN_RE = re.compile(r"-(?:opcount|benchmark-gas-value)_[^\]]+")
 # evm2's worker (crates/cli/Cargo.toml:35) enables alloy-primitives'
 # ``keccak-cache-global``; alloy v1.7.3's process-global keccak cache accepts
 # inputs of at most MAX_INPUT_LEN = 128 - 32 - 1 - 8 = 87 bytes
@@ -590,8 +593,8 @@ def ns_from_ms(ms: float) -> float:
 
 
 def _variant_of(case_id: str) -> str:
-    """Strip the terminal ``-opcount_...`` token from an exported case id."""
-    return OPCOUNT_TOKEN_RE.sub("", case_id)
+    """Strip the terminal work-size token from an exported case id."""
+    return COUNT_TOKEN_RE.sub("", case_id)
 
 
 def variant_param(variant_id: str, target_operation: str) -> str:
@@ -603,7 +606,7 @@ def variant_param(variant_id: str, target_operation: str) -> str:
 def _filter_prefix(variant_id: str) -> str:
     """``filter_by`` substring selecting exactly this variant's cases.
 
-    The exported id is ``<variant>-opcount_...``; the trailing ``-`` keeps
+    The exported id is ``<variant>-<work-size token>``; the trailing ``-`` keeps
     prefix-adjacent variants (``mod_32_exp_3`` vs ``mod_32_exp_32``) apart.
     """
     return variant_id[:-1] + "-" if variant_id.endswith("]") else variant_id + "-"
@@ -1188,6 +1191,8 @@ def classify_workload(workload: Mapping[str, Any]) -> dict[str, VariantInfo]:
 
 def build_analysis_config(
     workload: Mapping[str, Any],
+    *,
+    client: str,
     anchor_rate: float = DEFAULT_ANCHOR_RATE,
     min_sessions: int = MIN_SESSIONS_DEFAULT,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1264,7 +1269,7 @@ def build_analysis_config(
     qualification["min_sessions"] = min_sessions
     config = {
         "version": 1,
-        "clients": ["evm2"],
+        "clients": [client],
         "anchor_rate": int(anchor_rate),
         "gas_costs": {"fork": "osaka"},
         "output": {"plots": False},
@@ -1353,7 +1358,10 @@ def _validate_config_document(config: dict[str, Any], path: Path) -> str:
 def cmd_create_config(args: argparse.Namespace) -> int:
     workload = load_workload(Path(args.workload))
     config, sidecar = build_analysis_config(
-        workload, anchor_rate=args.anchor_rate, min_sessions=args.min_sessions
+        workload,
+        client=args.client,
+        anchor_rate=args.anchor_rate,
+        min_sessions=args.min_sessions,
     )
     out = Path(args.out)
     if out.exists():
@@ -2994,6 +3002,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Create the per-variant glue-enabled 600M analysis config",
     )
     create.add_argument("--workload", required=True, type=Path)
+    create.add_argument(
+        "--client",
+        required=True,
+        help="Engine whose runtimes are analyzed (the runtimes CSV client_name)",
+    )
     create.add_argument("--out", required=True, type=Path)
     create.add_argument("--anchor-rate", type=float, default=DEFAULT_ANCHOR_RATE)
     create.add_argument("--min-sessions", type=int, default=MIN_SESSIONS_DEFAULT)

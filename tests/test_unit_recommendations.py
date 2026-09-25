@@ -319,7 +319,7 @@ def test_create_config_excludes_calibration_from_every_model() -> None:
             parameters={"campaign_role": "calibration"},
         )
     )
-    config, sidecar = rec.build_analysis_config(workload)
+    config, sidecar = rec.build_analysis_config(workload, client="evm2")
     assert len(config["models"]["custom"]) == 2
     assert sidecar["campaign_roles"]["calibration_cases"] == 1
     assert sidecar["campaign_roles"]["calibration_priced"] == 0
@@ -338,7 +338,7 @@ def test_create_config_rejects_calibration_matching_a_target_filter() -> None:
         )
     )
     with pytest.raises(rec.WorkloadError, match="calibration-lane case"):
-        rec.build_analysis_config(workload)
+        rec.build_analysis_config(workload, client="evm2")
 
 
 def test_load_workload_rejects_foreign_fork_and_schema(tmp_path: Path) -> None:
@@ -361,7 +361,7 @@ def test_load_workload_rejects_foreign_fork_and_schema(tmp_path: Path) -> None:
 
 
 def test_create_config_freezes_policy_constants() -> None:
-    config, _ = rec.build_analysis_config(_mini_workload())
+    config, _ = rec.build_analysis_config(_mini_workload(), client="evm2")
     assert config["glue_adjustment"] == {"enabled": True}
     assert config["modeling"]["bootstrap_iterations"] == 1000
     assert config["modeling"]["random_seed"] == 20260922
@@ -604,7 +604,7 @@ def test_build_end_to_end_reports_every_variant_and_group(tmp_path: Path) -> Non
             parameters={"reason": "no fixed-count generator"},
         )
     )
-    config, _ = rec.build_analysis_config(workload)
+    config, _ = rec.build_analysis_config(workload, client="evm2")
     analysis = _synthetic_analysis(tmp_path, config)
     diagnostics = tmp_path / "samples.jsonl"
     blake_variant = "t/b.py::test_blake2f_benchmark[fork_Osaka--num_rounds_24]"
@@ -677,7 +677,7 @@ def test_build_end_to_end_reports_every_variant_and_group(tmp_path: Path) -> Non
 
 def test_build_blocks_group_when_glue_coverage_incomplete(tmp_path: Path) -> None:
     workload = _mini_workload()
-    config, _ = rec.build_analysis_config(workload)
+    config, _ = rec.build_analysis_config(workload, client="evm2")
     analysis = _synthetic_analysis(tmp_path, config)
     # Corrupt coverage on the ADD proposal row: STOP detected but unpriced.
     rows = list(csv.DictReader((analysis / "new_gas_all_params.csv").open(newline="")))
@@ -706,7 +706,7 @@ def test_build_blocks_group_when_glue_coverage_incomplete(tmp_path: Path) -> Non
 
 def test_build_marks_missing_glue_columns_as_unknown_coverage(tmp_path: Path) -> None:
     workload = _mini_workload()
-    config, _ = rec.build_analysis_config(workload)
+    config, _ = rec.build_analysis_config(workload, client="evm2")
     analysis = _synthetic_analysis(tmp_path, config)
     rows = list(csv.DictReader((analysis / "new_gas_all_params.csv").open(newline="")))
     for row in rows:
@@ -726,7 +726,7 @@ def test_build_marks_missing_glue_columns_as_unknown_coverage(tmp_path: Path) ->
 
 def test_threshold_boundary_at_2x(tmp_path: Path) -> None:
     workload = _mini_workload()
-    config, _ = rec.build_analysis_config(workload)
+    config, _ = rec.build_analysis_config(workload, client="evm2")
     analysis = _synthetic_analysis(tmp_path, config)
     rows = list(csv.DictReader((analysis / "new_gas_all_params.csv").open(newline="")))
     # ADD current 3 gas: lower bound exactly 6.0 gas -> 2.0x triggers.
@@ -757,7 +757,7 @@ def test_threshold_boundary_at_2x(tmp_path: Path) -> None:
 
 def test_no_decreases_candidate_floors_at_current(tmp_path: Path) -> None:
     workload = _mini_workload()
-    config, _ = rec.build_analysis_config(workload)
+    config, _ = rec.build_analysis_config(workload, client="evm2")
     analysis = _synthetic_analysis(tmp_path, config)
     rows = list(csv.DictReader((analysis / "new_gas_all_params.csv").open(newline="")))
     for row in rows:
@@ -802,7 +802,7 @@ def test_cached_keccak_variant_never_drives_increase(tmp_path: Path) -> None:
             ),
         ]
     )
-    config, _ = rec.build_analysis_config(workload)
+    config, _ = rec.build_analysis_config(workload, client="evm2")
     analysis = _synthetic_analysis(tmp_path, config)
     rows = list(csv.DictReader((analysis / "new_gas_all_params.csv").open(newline="")))
     # Cached variant: enormous lower bound; uncached: modest evidence.
@@ -1052,7 +1052,7 @@ def test_build_uses_embedded_config_json_yaml_and_hash_validation(
     import yaml
 
     workload = _mini_workload()
-    config, _ = rec.build_analysis_config(workload)
+    config, _ = rec.build_analysis_config(workload, client="evm2")
     analysis = _synthetic_analysis(tmp_path, config)
     status_path = analysis / "analysis_status.json"
     status = json.loads(status_path.read_text())
@@ -1093,3 +1093,15 @@ def test_build_uses_embedded_config_json_yaml_and_hash_validation(
     status_path.write_text(json.dumps(tampered_hash))
     with pytest.raises(rec.BuildError):
         rec.build_recommendations(workload, analysis, None)
+
+
+def test_work_size_token_stripping_is_mode_independent() -> None:
+    fixed = "t/a.py::test_arithmetic[fork_Osaka--opcode_DIV-0-opcount_0.25K]"
+    budget = (
+        "t/a.py::test_arithmetic[fork_Osaka--opcode_DIV-0-benchmark-gas-value_120M]"
+    )
+    variant = "t/a.py::test_arithmetic[fork_Osaka--opcode_DIV-0]"
+    assert rec._variant_of(fixed) == variant
+    assert rec._variant_of(budget) == variant
+    # Budgets sharing a digit prefix stay one variant, not two.
+    assert rec._variant_of(budget.replace("120M", "100M")) == variant
